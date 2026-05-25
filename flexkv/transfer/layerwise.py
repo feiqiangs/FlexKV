@@ -143,6 +143,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
         flexkv_logger.debug(f"[LayerwiseWorker] Eventfds received, tensor shape={layer_eventfds_tensor.shape}")
+        # Pre-convert eventfds to Python list for O(1) indexing and pre-pack write value.
+        # This enables Python-side eventfd notification as a fallback for platforms
+        # (e.g. P800/XPU) where CUDA host callbacks may not fire.
+        self._layer_eventfds_list = layer_eventfds_tensor.tolist() if layer_eventfds_tensor.numel() > 0 else []
+        self._eventfd_val = struct.pack('Q', 1)
 
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker] Pinning CPU Memory: "
@@ -456,6 +461,25 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         )
         return tensor
 
+    def _write_layer_eventfds(self, counter_id: int, layer_id: int) -> None:
+        """Write eventfd for a completed layer (all TP ranks).
+
+        On P800/XPU, CUDA host callbacks (cudaLaunchHostFunc) do not fire,
+        so we write eventfds from Python after cudaStreamSynchronize returns.
+        """
+        if not self._layer_eventfds_list:
+            return
+        # list layout: [num_counters * tp_size * num_layers] flat
+        # index: counter_id * tp_size * num_layers + tp_rank * num_layers + layer_id
+        base = counter_id * self.tp_group_size * self.num_layers + layer_id
+        step = self.num_layers
+        eventfd_val = self._eventfd_val
+        fds_list = self._layer_eventfds_list
+        for tp_rank in range(self.tp_group_size):
+            fd = fds_list[base + tp_rank * step]
+            if fd >= 0:
+                os.write(fd, eventfd_val)
+
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,
                       dst_block_ids_h2d: torch.Tensor,
@@ -563,6 +587,14 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             indexer_dst_block_ids=indexer_dst_block_ids,
         )
         end_time = time.time()
+
+        # P800/XPU: CUDA host callbacks (cudaLaunchHostFunc) may not fire on
+        # non-NVIDIA platforms. Write eventfds from Python after transfer completes
+        # to ensure sglang's _layer_done_counter receives the notification.
+        if self._layer_eventfds_list:
+            counter_id = transfer_op.counter_id
+            for layer_id in range(self.num_layers):
+                self._write_layer_eventfds(counter_id, layer_id)
 
         transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * self.kv_dim
 
