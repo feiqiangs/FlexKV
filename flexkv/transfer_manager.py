@@ -523,6 +523,12 @@ class TransferManagerOnRemote(TransferManager):
                                "for TransferManager subprocess")
             env.pop('CUDA_VISIBLE_DEVICES', None)
 
+        # Propagate FLEXKV_NUMA_* knobs so the subprocess (which is the actual
+        # owner of the main + indexer CPU KV pools on remote nodes) can apply
+        # the same NUMA policy.
+        from flexkv.common.numa import merge_numa_env
+        merge_numa_env(env)
+
         # Create the subprocess script
         transfer_manager_script = textwrap.dedent(f'''
             import os
@@ -533,6 +539,18 @@ class TransferManagerOnRemote(TransferManager):
 
             # Immediately disable MPI to avoid conflicts
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
+
+            # Reset NUMA mempolicy BEFORE any heavy import (e.g. torch) and
+            # before the StorageEngine inside TransferManager allocates the
+            # main + indexer CPU KV pools.
+            try:
+                from flexkv.common.numa import apply_numa_policy, dump_numa_maps_summary
+                apply_numa_policy(role="TransferManagerOnRemote")
+            except Exception as _numa_e:
+                flexkv_logger.warning(
+                    f"[FlexKV][NUMA] apply_numa_policy failed in "
+                    f"TransferManagerOnRemote subprocess: {{_numa_e!r}}"
+                )
 
             try:
                 # Load the class and kwargs
@@ -548,6 +566,15 @@ class TransferManagerOnRemote(TransferManager):
                 flexkv_logger.info(f"Starting TransferManagerOnRemote instance...")
                 instance.start()
                 flexkv_logger.info(f"TransferManager instance started successfully")
+                # After StorageEngine.__init__ has finished allocating the
+                # main & indexer CPU KV pools, dump per-NUMA-node RSS to
+                # verify the policy actually took effect.
+                try:
+                    dump_numa_maps_summary(os.getpid(), tag="after-cpu-alloc")
+                except Exception as _numa_e:
+                    flexkv_logger.warning(
+                        f"[FlexKV][NUMA] dump_numa_maps_summary failed: {{_numa_e!r}}"
+                    )
 
                 # Keep running until worker thread exits
                 if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
@@ -565,10 +592,18 @@ class TransferManagerOnRemote(TransferManager):
                     pass
         ''').strip()
 
-        # Start the subprocess
-        process = subprocess.Popen([
+        # Start the subprocess; wrap the argv with `numactl` so that the
+        # subprocess (and any descendants it forks) is detached from the
+        # parent's NUMA binding (e.g. the sglang scheduler that may have been
+        # bound to NUMA0 via SGLANG_NUMA_BIND_V2=1).
+        from flexkv.common.numa import wrap_with_numactl
+        popen_argv = wrap_with_numactl([
             sys.executable, '-c', transfer_manager_script
-        ], env=env, stdout=None, stderr=None, text=True)  # None = inherit parent's stdout/stderr
+        ])
+        process = subprocess.Popen(
+            popen_argv,
+            env=env, stdout=None, stderr=None, text=True,
+        )  # None = inherit parent's stdout/stderr
         flexkv_logger.info(f"TransferManager subprocess started, PID: {process.pid}")
 
         # Clean up temporary files after subprocess completes
@@ -733,10 +768,32 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                                f"gpu_register_port={gpu_register_port}")
             start_event.set()
             os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
+            # Reset NUMA mempolicy BEFORE constructing TransferManager / StorageEngine
+            # so that both the main CPU KV pool and the (optional) indexer CPU KV
+            # pool allocated inside StorageEngine.__init__ are spread according to
+            # FLEXKV_NUMA_POLICY (default: interleave-all).
+            try:
+                from flexkv.common.numa import apply_numa_policy
+                apply_numa_policy(role="TransferManagerInterProcessHandle")
+            except Exception as _numa_e:  # noqa: BLE001 - best-effort
+                flexkv_logger.warning(
+                    f"[FlexKV][NUMA] apply_numa_policy failed in "
+                    f"_process_worker: {_numa_e!r}"
+                )
             transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
             flexkv_logger.debug("TransferEngine started successfully, setting ready_event")
+            # After StorageEngine.__init__ has finished allocating the main &
+            # indexer CPU KV pools, dump per-NUMA-node RSS summary to verify
+            # the policy actually took effect.
+            try:
+                from flexkv.common.numa import dump_numa_maps_summary
+                dump_numa_maps_summary(os.getpid(), tag="after-cpu-alloc")
+            except Exception as _numa_e:  # noqa: BLE001
+                flexkv_logger.warning(
+                    f"[FlexKV][NUMA] dump_numa_maps_summary failed: {_numa_e!r}"
+                )
             ready_event.set()
 
             # Setup selector for event-driven processing (complete zero polling!)

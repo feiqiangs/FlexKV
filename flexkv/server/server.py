@@ -256,6 +256,18 @@ class KVServer:
             # Remove CUDA_VISIBLE_DEVICES so server can see all GPUs
             env.pop('CUDA_VISIBLE_DEVICES', None)
 
+            # Make sure FLEXKV_NUMA_* knobs are present in the subprocess env
+            # even when ``inherit_env=False`` (sglang's default code path) so
+            # that any descendants can read them.
+            try:
+                from flexkv.common.numa import merge_numa_env
+                merge_numa_env(env)
+            except Exception as _numa_e:  # noqa: BLE001
+                flexkv_logger.warning(
+                    f"[FlexKV][NUMA] merge_numa_env failed in "
+                    f"KVServer.create_server: {_numa_e!r}"
+                )
+
             # Serialize arguments
             args_data = pickle.dumps((model_config, cache_config, gpu_register_port, server_recv_port))
 
@@ -267,14 +279,34 @@ class KVServer:
                 sys.path.insert(0, "{flexkv_root}")
                 from flexkv.server.server import KVServer
 
+                # Apply NUMA mempolicy as early as possible (before KVServer
+                # constructs any heavy state) so that descendants spawned via
+                # KVTaskEngine.start() inherit the desired policy.
+                try:
+                    from flexkv.common.numa import apply_numa_policy
+                    apply_numa_policy(role="KVServer")
+                except Exception as _numa_e:
+                    print(f"[FlexKV][NUMA] apply_numa_policy failed in "
+                          f"KVServer subprocess: {{_numa_e!r}}", flush=True)
+
                 args_data = {args_data!r}
                 model_config, cache_config, gpu_register_port, server_recv_port = pickle.loads(args_data)
                 server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
                 server.run()
             ''').strip()
-            process = subprocess.Popen([
-                sys.executable, '-c', server_script
-            ], env=env)
+            # Wrap argv with `numactl` so the KVServer subprocess - and any
+            # children it spawns (e.g. TransferManagerInterProcessHandle) -
+            # are detached from the parent's NUMA binding (sglang's GPU0
+            # scheduler is typically bound to NUMA0).
+            try:
+                from flexkv.common.numa import wrap_with_numactl
+                popen_argv = wrap_with_numactl([sys.executable, '-c', server_script])
+            except Exception as _numa_e:  # noqa: BLE001
+                flexkv_logger.warning(
+                    f"[FlexKV][NUMA] wrap_with_numactl failed: {_numa_e!r}"
+                )
+                popen_argv = [sys.executable, '-c', server_script]
+            process = subprocess.Popen(popen_argv, env=env)
 
             flexkv_logger.info(
                 f"KVServer subprocess started, PID: {process.pid}, "
