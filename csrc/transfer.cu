@@ -22,11 +22,171 @@
 #include <cstring>
 #include <utility>
 #include <vector>
+#include <chrono>
+#include <cstdio>
+#include <algorithm>
+#include <cerrno>
+#include <string>
+#include <sys/mman.h>
 
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
 
 namespace flexkv {
+
+// [PATCH 06-10] inner-inner timing for path 1/2 inside transfer_kv_blocks
+namespace {
+inline bool inner_path_timing_enabled() {
+  static const int v = []() {
+    const char *e = std::getenv("FLEXKV_PATH_TIMING");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  return v != 0;
+}
+inline double now_ms_path() {
+  using namespace std::chrono;
+  return duration<double, std::milli>(
+             steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+
+
+// ----------------------------------------------------------------------------
+// SGLang-compatible transfer tuning helpers (copied/adapted from hicache transfer.cc)
+// ----------------------------------------------------------------------------
+// Env compatibility:
+//   XSGL_TRANSFER_MERGED=1                -> force path2 merged path
+//   XSGL_TRANSFER_SEGMENT_THRESHOLD=N     -> path1/path2 threshold, default 8
+//   XSGL_TRANSFER_HUGEPAGE_MIN_BYTES=N    -> min thread-local staging buffer, default 288MB
+static bool is_transfer_merged_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *env = std::getenv("XSGL_TRANSFER_MERGED");
+    enabled = (env && (std::string(env) == "1" || std::string(env) == "true")) ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
+static int64_t get_segment_count_threshold() {
+  static int64_t threshold = -1;
+  if (threshold < 0) {
+    const char *env = std::getenv("XSGL_TRANSFER_SEGMENT_THRESHOLD");
+    if (env == nullptr || env[0] == '\0') {
+      // Backward compatibility during rollout: old FlexKV env may still exist.
+      env = std::getenv("FLEXKV_TRANSFER_SEGMENT_THRESHOLD");
+    }
+    if (env) {
+      threshold = std::atoll(env);
+      if (threshold <= 0) threshold = 8;
+    } else {
+      threshold = 8;
+    }
+  }
+  return threshold;
+}
+
+static size_t get_hugepage_default_min_bytes() {
+  static size_t default_bytes = 0;
+  if (default_bytes == 0) {
+    const char *env = std::getenv("XSGL_TRANSFER_HUGEPAGE_MIN_BYTES");
+    if (env && *env) {
+      default_bytes = static_cast<size_t>(std::atoll(env));
+    } else {
+      default_bytes = static_cast<size_t>(256) * 1024 * 1152;  // 256K tokens * 1152B ~= 288MB
+    }
+    constexpr size_t HUGEPAGE_ALIGN = 2ULL * 1024 * 1024;
+    default_bytes = (default_bytes + HUGEPAGE_ALIGN - 1) / HUGEPAGE_ALIGN * HUGEPAGE_ALIGN;
+  }
+  return default_bytes;
+}
+
+static void *alloc_hugepage_memory(size_t size) {
+  bool is_hugepage = false;
+  void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (ptr == MAP_FAILED) {
+    fprintf(stderr, "[TRANSFER_WARN] mmap failed size=%zu errno=%d(%s)\n", size, errno, std::strerror(errno));
+    return nullptr;
+  }
+  if (madvise(ptr, size, MADV_HUGEPAGE) == 0) {
+    is_hugepage = true;
+  } else {
+    fprintf(stderr, "[TRANSFER_WARN] madvise(MADV_HUGEPAGE) failed ptr=%p size=%zu errno=%d(%s)\n",
+            ptr, size, errno, std::strerror(errno));
+  }
+
+  // Fault-in pages up front. This avoids first-transfer page-fault spikes.
+  std::memset(ptr, 0, size);
+
+  cudaError_t err = cudaHostRegister(ptr, size, 0);
+  if (err != cudaSuccess) {
+    fprintf(stderr,
+            "[TRANSFER_WARN] cudaHostRegister failed ptr=%p size=%zu hugepage=%d: %s. "
+            "cudaMemcpyAsync may fall back to slower pageable staging.\n",
+            ptr, size, static_cast<int>(is_hugepage), cudaGetErrorString(err));
+  }
+  return ptr;
+}
+
+static void free_hugepage_memory(void *ptr, size_t size) {
+  if (ptr) {
+    cudaHostUnregister(ptr);  // best effort; ignore failure
+    munmap(ptr, size);
+  }
+}
+
+struct HugepageBufferHolder {
+  void *ptr = nullptr;
+  size_t size = 0;
+  ~HugepageBufferHolder() {
+    if (ptr != nullptr) {
+      free_hugepage_memory(ptr, size);
+      ptr = nullptr;
+      size = 0;
+    }
+  }
+};
+
+static void *get_cached_hugepage_buffer(size_t needed_size) {
+  static thread_local HugepageBufferHolder holder;
+  if (holder.ptr != nullptr && holder.size >= needed_size) {
+    return holder.ptr;
+  }
+  const size_t new_size = std::max(needed_size, get_hugepage_default_min_bytes());
+  if (holder.ptr != nullptr) {
+    free_hugepage_memory(holder.ptr, holder.size);
+    holder.ptr = nullptr;
+    holder.size = 0;
+  }
+  void *p = alloc_hugepage_memory(new_size);
+  if (p == nullptr) return nullptr;
+  holder.ptr = p;
+  holder.size = new_size;
+  return holder.ptr;
+}
+
+struct CudaEventPairHolder {
+  cudaEvent_t events[2] = {nullptr, nullptr};
+  bool initialized = false;
+  void ensure_init() {
+    if (initialized) return;
+    cudaEventCreateWithFlags(&events[0], cudaEventDisableTiming | cudaEventBlockingSync);
+    cudaEventCreateWithFlags(&events[1], cudaEventDisableTiming | cudaEventBlockingSync);
+    initialized = true;
+  }
+  ~CudaEventPairHolder() {
+    if (initialized) {
+      if (events[0]) cudaEventDestroy(events[0]);
+      if (events[1]) cudaEventDestroy(events[1]);
+    }
+  }
+};
+
+static cudaEvent_t *get_cached_pingpong_events() {
+  static thread_local CudaEventPairHolder holder;
+  holder.ensure_init();
+  return holder.events;
+}
 
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
 
@@ -158,12 +318,7 @@ void transfer_kv_blocks(
         int v = std::atoi(e);
         return (v == 0 || v == 1 || v == 2) ? v : -1;
       }();
-      static const int64_t segment_threshold = []() {
-        const char *e = std::getenv("FLEXKV_TRANSFER_SEGMENT_THRESHOLD");
-        if (e == nullptr || e[0] == '\0') return static_cast<int64_t>(8);
-        int64_t v = std::atoll(e);
-        return v > 0 ? v : static_cast<int64_t>(8);
-      }();
+      const int64_t segment_threshold = get_segment_count_threshold();
 
       // Step 1: scan ids on host to detect contiguity / segments.
       bool src_contig = false, dst_contig = false;
@@ -183,6 +338,10 @@ void transfer_kv_blocks(
       else if (src_contig && dst_contig) chosen_path = 0;
       else if (num_segments <= segment_threshold) chosen_path = 1;
       else chosen_path = 2;
+      if (is_transfer_merged_enabled()) {
+        // Match SGLang XSGL_TRANSFER_MERGED behavior: force merged path for testing/optimization.
+        chosen_path = 2;
+      }
 
       // ----- Path 0: single big memcpy per (layer, kv_dim) -----
       if (chosen_path == 0) {
@@ -213,6 +372,10 @@ void transfer_kv_blocks(
       }
       // ----- Path 1: per-segment memcpy -----
       else if (chosen_path == 1) {
+        // [PATCH 06-10] path 1 inner timing
+        const bool _ptiming = inner_path_timing_enabled();
+        double _t0 = _ptiming ? now_ms_path() : 0.0;
+
         // Build segment list on host: each segment is (start_k, run_len)
         // where for [start_k, start_k+run_len) BOTH gpu and cpu ids step by 1.
         // Mirrors SGLang Path 1: pure logical-id check, no per-segment GPU
@@ -233,6 +396,9 @@ void transfer_kv_blocks(
             seg_start = k;
           }
         }
+
+        double _t_seg_done = _ptiming ? now_ms_path() : 0.0;
+        size_t _seg_count = segments.size();
 
         for (int i = 0; i < num_layers; i++) {
           for (int j = 0; j < kv_dim; j++) {
@@ -261,6 +427,20 @@ void transfer_kv_blocks(
               FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, seg_size);
             }
           }
+        }
+        if (_ptiming) {
+          double _t_launch_done = now_ms_path();
+          int64_t total_launches = (int64_t)num_layers * (int64_t)kv_dim *
+                                    (int64_t)_seg_count;
+          fprintf(stderr,
+              "[PATH1] dir=%s blocks=%d layers=%d kv_dim=%d segs=%zu "
+              "total_launches=%lld build_seg=%.2fms launch_loop=%.2fms\n",
+              is_host_to_device ? "H2D" : "D2H",
+              num_blocks, num_layers, kv_dim, _seg_count,
+              (long long)total_launches,
+              _t_seg_done - _t0,
+              _t_launch_done - _t_seg_done);
+          fflush(stderr);
         }
       }
       // ----- Path 2: gather/scatter pipeline (mirrors SGLang Path 2) -----
@@ -342,29 +522,25 @@ void transfer_kv_blocks(
             (is_host_to_device && !src_contig);
 
         at::Tensor dev_buf[2];
-        at::Tensor host_buf[2];
         if (need_dev_buf) {
           dev_buf[0] = at::empty({num_blocks, elems_per_block}, i64_cuda_opts);
           dev_buf[1] = at::empty({num_blocks, elems_per_block}, i64_cuda_opts);
         }
+
+        // SGLang-style thread-local hugepage pinned staging buffer.
+        // Avoid per-transfer at::empty(... pinned_memory=true) / cudaHostAlloc overhead.
+        void *host_buf[2] = {nullptr, nullptr};
         if (need_host_buf) {
-          auto pinned_opts = at::TensorOptions()
-                                 .dtype(at::kLong)
-                                 .device(at::kCPU)
-                                 .pinned_memory(true);
-          host_buf[0] = at::empty({num_blocks, elems_per_block}, pinned_opts);
-          host_buf[1] = at::empty({num_blocks, elems_per_block}, pinned_opts);
+          void *host_buffer_base = get_cached_hugepage_buffer(static_cast<size_t>(buffer_size_bytes) * 2);
+          TORCH_CHECK(host_buffer_base != nullptr, "Failed to allocate cached hugepage host buffer for FlexKV transfer");
+          host_buf[0] = host_buffer_base;
+          host_buf[1] = static_cast<char *>(host_buffer_base) + buffer_size_bytes;
         }
 
-        // Ping-pong events when host staging is involved (scatter must wait
-        // for the corresponding GPU stage to complete on its slot).
-        cudaEvent_t pp_events[2] = {nullptr, nullptr};
+        // SGLang-style thread-local ping-pong events when host staging is involved.
+        cudaEvent_t *pp_events = need_host_buf ? get_cached_pingpong_events() : nullptr;
         bool pp_used[2] = {false, false};
         bool need_pp_events = need_host_buf;
-        if (need_pp_events) {
-          cudaEventCreateWithFlags(&pp_events[0], cudaEventDisableTiming);
-          cudaEventCreateWithFlags(&pp_events[1], cudaEventDisableTiming);
-        }
 
         // CPU scatter helper for D2H non-contig dst.
         auto cpu_scatter = [&](void *staging_base, int layer_idx, int kv_idx) {
@@ -456,7 +632,7 @@ void transfer_kv_blocks(
                   cpu_block_ids[0] * cpu_block_stride_int64 +
                   cpu_startoff_inside_chunks_int64;
             } else {
-              d2h_dst_ptr = host_buf[idx].data_ptr();
+              d2h_dst_ptr = host_buf[idx];
             }
             cudaMemcpyAsync(d2h_dst_ptr, d2h_src_ptr_int64, buffer_size_bytes,
                             cudaMemcpyDeviceToHost, stream);
@@ -470,7 +646,7 @@ void transfer_kv_blocks(
                 cudaEventSynchronize(pp_events[prev_idx]);
                 const int prev_i = static_cast<int>((it - 1) / kv_dim);
                 const int prev_j = static_cast<int>((it - 1) % kv_dim);
-                cpu_scatter(host_buf[prev_idx].data_ptr(), prev_i, prev_j);
+                cpu_scatter(host_buf[prev_idx], prev_i, prev_j);
               }
             }
           } else {
@@ -491,8 +667,8 @@ void transfer_kv_blocks(
                 // consumed it) has completed before we overwrite it.
                 cudaEventSynchronize(pp_events[idx]);
               }
-              cpu_gather(host_buf[idx].data_ptr(), i, j);
-              h2d_src_ptr = host_buf[idx].data_ptr();
+              cpu_gather(host_buf[idx], i, j);
+              h2d_src_ptr = host_buf[idx];
             }
 
             // Step B (H2D copy)
@@ -534,7 +710,7 @@ void transfer_kv_blocks(
               cudaEventSynchronize(pp_events[last_idx]);
               const int li = static_cast<int>(last / kv_dim);
               const int lj = static_cast<int>(last % kv_dim);
-              cpu_scatter(host_buf[last_idx].data_ptr(), li, lj);
+              cpu_scatter(host_buf[last_idx], li, lj);
             }
           }
         }
@@ -545,11 +721,6 @@ void transfer_kv_blocks(
         // here when GPU scatter ran on non-default stream paths).
         if (is_host_to_device && !dst_contig) {
           cudaStreamSynchronize(stream);
-        }
-
-        if (need_pp_events) {
-          cudaEventDestroy(pp_events[0]);
-          cudaEventDestroy(pp_events[1]);
         }
       }
     } else {

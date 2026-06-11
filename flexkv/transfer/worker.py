@@ -538,6 +538,21 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        # [PATCH 06-10] 拆分 D2H/H2D 时间为 3 段：queue_wait / kernel_launch / real_copy
+        # 用法：在 worker process 启动时设 FLEXKV_DETAIL_TIMING=1 即开启细分日志
+        detail_timing = os.environ.get("FLEXKV_DETAIL_TIMING", "0") == "1"
+
+        if detail_timing:
+            # t0: 拿到 op，准备开始
+            t0 = time.time()
+            # 等待之前所有 GPU 操作完成（测排队/上一次 op 排空时间）
+            for i in range(self.num_gpus):
+                try:
+                    torch.cuda.synchronize(self.gpu_blocks[i][0].device)
+                except Exception:
+                    break
+            t_queue_done = time.time()
+
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
@@ -546,8 +561,33 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             dst_block_ids,
             transfer_op.transfer_type,
         )
-        end_time = time.time()
+        end_time = time.time()  # _transfer_impl 返回 = kernel 已 launch（D2H 异步）
+
+        if detail_timing:
+            # 真正等本次 D2H/H2D 完成
+            for i in range(self.num_gpus):
+                try:
+                    torch.cuda.synchronize(self.gpu_blocks[i][0].device)
+                except Exception:
+                    break
+            t_real_done = time.time()
+
         transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
+
+        if detail_timing:
+            queue_wait = t_queue_done - t0
+            kernel_launch = end_time - start_time
+            real_copy = t_real_done - end_time
+            real_bw = transfer_size / max(real_copy, 1e-6) / 1e9
+            launch_bw = transfer_size / max(kernel_launch + real_copy, 1e-6) / 1e9
+            flexkv_logger.info(
+                f"[DETAIL] {transfer_op.transfer_type.name} req={transfer_op.transfer_op_id} "
+                f"size={transfer_size/(1024**3):.3f}GB blocks={transfer_op.valid_block_num} "
+                f"queue_wait={queue_wait*1000:.1f}ms "
+                f"kernel_launch={kernel_launch*1000:.1f}ms "
+                f"real_copy={real_copy*1000:.1f}ms "
+                f"real_bw={real_bw:.2f}GB/s launch+copy_bw={launch_bw:.2f}GB/s"
+            )
 
         self._log_transfer_performance(
             transfer_op,

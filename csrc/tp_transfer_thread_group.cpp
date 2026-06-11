@@ -17,8 +17,32 @@
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
 #include <stdexcept>
+#include <chrono>
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
 
 namespace flexkv {
+
+// [PATCH 06-10] inner timing for tp_group_transfer
+// Enable: set FLEXKV_INNER_TIMING=1
+// Output goes to stderr (visible in worker process log) with [INNER] prefix.
+static inline bool inner_timing_enabled() {
+  static const int v = []() {
+    const char *e = std::getenv("FLEXKV_INNER_TIMING");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  return v != 0;
+}
+
+static inline double now_ms() {
+  using namespace std::chrono;
+  return duration<double, std::milli>(
+             steady_clock::now().time_since_epoch()).count();
+}
+
+// monotonic op id for log grouping
+static std::atomic<uint64_t> g_inner_op_seq{0};
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
@@ -157,6 +181,16 @@ void TPTransferThreadGroup::tp_group_transfer(
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla) {
 
+  // [PATCH 06-10] inner timing
+  const bool tracing = inner_timing_enabled();
+  uint64_t op_id = tracing ? g_inner_op_seq.fetch_add(1) : 0;
+  double t_enter = tracing ? now_ms() : 0.0;
+  // per-thread tracing data: enqueue_to_start, kernel_launch, lambda_total
+  std::vector<double> per_t_enq_to_start(num_gpus_, 0.0);
+  std::vector<double> per_t_kernel_launch(num_gpus_, 0.0);
+  std::vector<double> per_t_lambda_total(num_gpus_, 0.0);
+  std::vector<int64_t> per_t_num_blocks(num_gpus_, 0);
+
   std::atomic<bool> failed{false};
   std::string error_msg;
   // threads_.clear();
@@ -168,10 +202,14 @@ void TPTransferThreadGroup::tp_group_transfer(
 
   bool enable_sharded_d2h = is_mla && !is_host_to_device;
 
+  double t_before_enqueue = tracing ? now_ms() : 0.0;
+
   for (int i = 0; i < num_gpus_; ++i) {
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
+      double t_lambda_start = tracing ? now_ms() : 0.0;
       try {
         int num_blocks = gpu_block_id_tensor.numel();
+        if (tracing) per_t_num_blocks[i] = num_blocks;
 
         int64_t *gpu_block_ids =
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
@@ -192,6 +230,9 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t chunk_size = enable_sharded_d2h
                                  ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
                                  : gpu_chunk_sizes_in_bytes_[i];
+
+        double t_kernel_begin = tracing ? now_ms() : 0.0;
+
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
         case BackendType::VLLM:
@@ -223,6 +264,13 @@ void TPTransferThreadGroup::tp_group_transfer(
           break;
         }
 
+        double t_kernel_end = tracing ? now_ms() : 0.0;
+        if (tracing) {
+          per_t_enq_to_start[i] = t_lambda_start - t_before_enqueue;
+          per_t_kernel_launch[i] = t_kernel_end - t_kernel_begin;
+          per_t_lambda_total[i] = t_kernel_end - t_lambda_start;
+        }
+
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
           failed = true;
@@ -235,8 +283,45 @@ void TPTransferThreadGroup::tp_group_transfer(
     }));
   }
 
+  double t_before_wait = tracing ? now_ms() : 0.0;
+
   for (auto &f : futures) {
     f.get();
+  }
+
+  double t_after_wait = tracing ? now_ms() : 0.0;
+
+  if (tracing) {
+    // aggregate per-thread numbers
+    double max_enq = 0, max_kernel = 0, max_lambda = 0;
+    double min_enq = 1e18;
+    int slow_gpu = 0;
+    for (int i = 0; i < num_gpus_; ++i) {
+      if (per_t_enq_to_start[i] > max_enq) max_enq = per_t_enq_to_start[i];
+      if (per_t_enq_to_start[i] < min_enq) min_enq = per_t_enq_to_start[i];
+      if (per_t_kernel_launch[i] > max_kernel) max_kernel = per_t_kernel_launch[i];
+      if (per_t_lambda_total[i] > max_lambda) {
+        max_lambda = per_t_lambda_total[i];
+        slow_gpu = i;
+      }
+    }
+    double total = t_after_wait - t_enter;
+    double dispatch_overhead = t_before_enqueue - t_enter;
+    double wait_after = t_after_wait - t_before_wait - max_lambda;
+    fprintf(stderr,
+        "[INNER] op=%lu dir=%s gpus=%d blocks=%lld total=%.1fms "
+        "dispatch=%.1fms enq_min=%.1fms enq_max=%.1fms kernel_max=%.1fms "
+        "lambda_max=%.1fms(gpu%d) wait_extra=%.1fms\n",
+        (unsigned long)op_id,
+        is_host_to_device ? "H2D" : "D2H",
+        num_gpus_,
+        (long long)per_t_num_blocks[0],
+        total,
+        dispatch_overhead,
+        min_enq, max_enq, max_kernel,
+        max_lambda, slow_gpu,
+        wait_after);
+    fflush(stderr);
   }
 
   if (failed) {
