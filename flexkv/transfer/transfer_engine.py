@@ -165,6 +165,11 @@ class TransferEngine:
         )
         self._main_kv_d2h_inflight: Dict[WorkerKey, int] = defaultdict(int)
         self._pending_main_kv_d2h: Dict[WorkerKey, Deque[Tuple[TransferOp, WorkerHandle]]] = defaultdict(deque)
+        self._main_kv_d2h_child_to_worker_key: Dict[int, WorkerKey] = {}
+        self._pending_store_d2h_txns: Dict[
+            WorkerKey,
+            Deque[Tuple[TransferOp, WorkerHandle, TransferOp, WorkerHandle]],
+        ] = defaultdict(deque)
 
     def _init_workers(self) -> None:
         if self._running:
@@ -876,56 +881,127 @@ class TransferEngine:
     def _maybe_submit_main_kv_d2h(self, wk: WorkerKey, replica: TransferOp, worker: WorkerHandle) -> None:
         """Submit or queue a MAIN_KV_D2H child op with per-WorkerKey backpressure.
 
-        This throttles only main-KV D2H children; indexer D2H and all H2D paths are
-        unchanged.  The child is already registered in child/parent maps and
-        contributes to the parent pending_count before this method is called.
+        This legacy path throttles only main-KV D2H children.  When an indexer
+        worker can be paired with the same WorkerKey, D2H store ops use the
+        transaction path below so indexer and main-KV submissions are queued and
+        drained together.
         """
         if (
             replica.transfer_type != TransferType.D2H
-            or self._main_kv_d2h_inflight_limit <= 0
+            or getattr(self, "_main_kv_d2h_inflight_limit", 0) <= 0
         ):
             worker.submit_transfer(replica)
             return
 
+        self._main_kv_d2h_child_to_worker_key[replica.op_id] = wk
         if self._main_kv_d2h_inflight[wk] < self._main_kv_d2h_inflight_limit:
             self._main_kv_d2h_inflight[wk] += 1
             worker.submit_transfer(replica)
             flexkv_logger.debug(
                 f"[TransferEngine][D2H-BP] submit MAIN_KV_D2H replica_op_id={replica.op_id} "
                 f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
-                f"queued={len(self._pending_main_kv_d2h[wk])}"
+                f"queued={len(self._pending_main_kv_d2h[wk])}, "
+                f"txn_queued={len(self._pending_store_d2h_txns[wk])}"
             )
         else:
             self._pending_main_kv_d2h[wk].append((replica, worker))
             flexkv_logger.debug(
                 f"[TransferEngine][D2H-BP] queue MAIN_KV_D2H replica_op_id={replica.op_id} "
                 f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
-                f"queued={len(self._pending_main_kv_d2h[wk])}"
+                f"queued={len(self._pending_main_kv_d2h[wk])}, "
+                f"txn_queued={len(self._pending_store_d2h_txns[wk])}"
+            )
+
+    def _maybe_submit_store_d2h_transaction(
+        self,
+        wk: WorkerKey,
+        indexer_replica: TransferOp,
+        indexer_worker: WorkerHandle,
+        main_replica: TransferOp,
+        main_worker: WorkerHandle,
+    ) -> None:
+        """Submit or queue an atomic D2H store transaction.
+
+        A store transaction is the scheduling unit for one paired indexer D2H
+        and main-KV D2H replica.  Queuing the pair prevents queued main-KV D2H
+        ops from leaving their indexer D2H side effects running ahead of the
+        main-KV backpressure slot.
+        """
+        if self._main_kv_d2h_inflight_limit <= 0:
+            indexer_worker.submit_transfer(indexer_replica)
+            main_worker.submit_transfer(main_replica)
+            return
+
+        self._main_kv_d2h_child_to_worker_key[main_replica.op_id] = wk
+        if self._main_kv_d2h_inflight[wk] < self._main_kv_d2h_inflight_limit:
+            self._main_kv_d2h_inflight[wk] += 1
+            indexer_worker.submit_transfer(indexer_replica)
+            main_worker.submit_transfer(main_replica)
+            flexkv_logger.debug(
+                f"[TransferEngine][STORE-TXN] submit worker_key={wk}, "
+                f"indexer_op_id={indexer_replica.op_id}, main_op_id={main_replica.op_id}, "
+                f"inflight={self._main_kv_d2h_inflight[wk]}, "
+                f"txn_queued={len(self._pending_store_d2h_txns[wk])}, "
+                f"legacy_queued={len(self._pending_main_kv_d2h[wk])}"
+            )
+        else:
+            self._pending_store_d2h_txns[wk].append(
+                (indexer_replica, indexer_worker, main_replica, main_worker)
+            )
+            flexkv_logger.debug(
+                f"[TransferEngine][STORE-TXN] queue worker_key={wk}, "
+                f"indexer_op_id={indexer_replica.op_id}, main_op_id={main_replica.op_id}, "
+                f"inflight={self._main_kv_d2h_inflight[wk]}, "
+                f"txn_queued={len(self._pending_store_d2h_txns[wk])}, "
+                f"legacy_queued={len(self._pending_main_kv_d2h[wk])}"
             )
 
     def _on_main_kv_d2h_child_finished(self, child_op: TransferOp) -> None:
         """Release one MAIN_KV_D2H inflight slot and submit queued child ops."""
-        if child_op.transfer_type != TransferType.D2H or self._main_kv_d2h_inflight_limit <= 0:
+        if child_op.transfer_type != TransferType.D2H or getattr(self, "_main_kv_d2h_inflight_limit", 0) <= 0:
             return
 
-        # There is normally a single WorkerKey for the matching dp_client_id in
-        # standalone/TP8.  Use the same matching rule as submit-time.
-        worker_map = self._worker_map.get(TransferType.D2H)
-        if not isinstance(worker_map, dict):
-            return
-        sibling_keys = self._match_pp_siblings(worker_map, child_op.dp_client_id)
-        for wk in sibling_keys:
-            if self._main_kv_d2h_inflight[wk] > 0:
-                self._main_kv_d2h_inflight[wk] -= 1
-                flexkv_logger.debug(
-                    f"[TransferEngine][D2H-BP] finish MAIN_KV_D2H replica_op_id={child_op.op_id} "
-                    f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
-                    f"queued={len(self._pending_main_kv_d2h[wk])}"
-                )
-                self._drain_main_kv_d2h_queue(wk)
+        wk = self._main_kv_d2h_child_to_worker_key.pop(child_op.op_id, None)
+        if wk is None:
+            # Fallback for ops created before the child-to-worker map existed.
+            worker_map = self._worker_map.get(TransferType.D2H)
+            if not isinstance(worker_map, dict):
+                return
+            sibling_keys = self._match_pp_siblings(worker_map, child_op.dp_client_id)
+            wk = next((candidate for candidate in sibling_keys
+                       if self._main_kv_d2h_inflight[candidate] > 0), None)
+            if wk is None:
                 return
 
+        if self._main_kv_d2h_inflight[wk] > 0:
+            self._main_kv_d2h_inflight[wk] -= 1
+        flexkv_logger.debug(
+            f"[TransferEngine][D2H-BP] finish MAIN_KV_D2H replica_op_id={child_op.op_id} "
+            f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
+            f"queued={len(self._pending_main_kv_d2h[wk])}, "
+            f"txn_queued={len(self._pending_store_d2h_txns[wk])}"
+        )
+        self._drain_main_kv_d2h_queue(wk)
+
     def _drain_main_kv_d2h_queue(self, wk: WorkerKey) -> None:
+        while (
+            self._main_kv_d2h_inflight[wk] < self._main_kv_d2h_inflight_limit
+            and self._pending_store_d2h_txns[wk]
+        ):
+            indexer_replica, indexer_worker, main_replica, main_worker = (
+                self._pending_store_d2h_txns[wk].popleft()
+            )
+            self._main_kv_d2h_inflight[wk] += 1
+            indexer_worker.submit_transfer(indexer_replica)
+            main_worker.submit_transfer(main_replica)
+            flexkv_logger.debug(
+                f"[TransferEngine][STORE-TXN] drain worker_key={wk}, "
+                f"indexer_op_id={indexer_replica.op_id}, main_op_id={main_replica.op_id}, "
+                f"inflight={self._main_kv_d2h_inflight[wk]}, "
+                f"txn_queued={len(self._pending_store_d2h_txns[wk])}, "
+                f"legacy_queued={len(self._pending_main_kv_d2h[wk])}"
+            )
+
         while (
             self._main_kv_d2h_inflight[wk] < self._main_kv_d2h_inflight_limit
             and self._pending_main_kv_d2h[wk]
@@ -936,7 +1012,8 @@ class TransferEngine:
             flexkv_logger.debug(
                 f"[TransferEngine][D2H-BP] drain MAIN_KV_D2H replica_op_id={replica.op_id} "
                 f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
-                f"queued={len(self._pending_main_kv_d2h[wk])}"
+                f"queued={len(self._pending_main_kv_d2h[wk])}, "
+                f"txn_queued={len(self._pending_store_d2h_txns[wk])}"
             )
 
     @staticmethod
@@ -950,6 +1027,95 @@ class TransferEngine:
         PP siblings are the worker_keys that share it across pp_rank.
         """
         return [wk for wk in worker_map.keys() if wk.dp_client_id == dp_client_id]
+
+    def _try_assign_d2h_store_transaction(self, op: TransferOp) -> bool:
+        """Try to dispatch paired indexer/main D2H store replicas as one transaction.
+
+        This optimization applies only when both main-KV and indexer D2H workers
+        are WorkerKey-indexed dicts with matching PP siblings.  Other worker
+        shapes fall back to the generic fan-out path below.
+        """
+        if (
+            op.transfer_type != TransferType.D2H
+            or not self._has_indexer
+            or op.transfer_type not in self._indexer_worker_map
+            or getattr(self, "_main_kv_d2h_inflight_limit", 0) <= 0
+        ):
+            return False
+
+        main_worker = self._worker_map.get(op.transfer_type)
+        indexer_worker = self._indexer_worker_map.get(op.transfer_type)
+        if not isinstance(main_worker, dict) or not isinstance(indexer_worker, dict):
+            return False
+
+        num_pages = op.src_block_ids.size
+        if num_pages <= 0:
+            return False
+
+        main_sibling_keys = self._match_pp_siblings(main_worker, op.dp_client_id)
+        indexer_sibling_keys = self._match_pp_siblings(indexer_worker, op.dp_client_id)
+        if not main_sibling_keys:
+            raise ValueError(
+                f"No MAIN_KV_{op.transfer_type.name} worker found matching "
+                f"dp_client_id={op.dp_client_id}; "
+                f"available worker keys={list(main_worker.keys())}"
+            )
+        if set(main_sibling_keys) != set(indexer_sibling_keys):
+            flexkv_logger.debug(
+                f"[TransferEngine][STORE-TXN] fallback for parent_op_id={op.op_id}: "
+                f"main_keys={main_sibling_keys}, indexer_keys={indexer_sibling_keys}"
+            )
+            return False
+
+        for wk in main_sibling_keys:
+            indexer_replica = TransferOp(
+                graph_id=op.graph_id,
+                transfer_type=op.transfer_type,
+                src_block_ids=op.src_block_ids.copy(),
+                dst_block_ids=op.dst_block_ids.copy(),
+                dp_client_id=op.dp_client_id,
+            )
+            register_op_to_buffer(indexer_replica, self.pin_buffer)
+            self._child_id_to_child[indexer_replica.op_id] = indexer_replica
+            self._child_to_parent_op_id[indexer_replica.op_id] = op.op_id
+            self.op_id_to_nvtx_range[indexer_replica.op_id] = nvtx.start_range(
+                f"schedule {indexer_replica.transfer_type.name}_INDEXER_TXN_REPLICA "
+                f"op_id: {indexer_replica.op_id}, graph_id: {indexer_replica.graph_id}, "
+                f"worker_key={wk}",
+                color=get_nvtx_range_color(indexer_replica.graph_id))
+            op.pending_count += 1
+
+            main_replica = TransferOp(
+                graph_id=op.graph_id,
+                transfer_type=op.transfer_type,
+                src_block_ids=op.src_block_ids.copy(),
+                dst_block_ids=op.dst_block_ids.copy(),
+                dp_client_id=op.dp_client_id,
+            )
+            register_op_to_buffer(main_replica, self.pin_buffer)
+            self._child_id_to_child[main_replica.op_id] = main_replica
+            self._child_to_parent_op_id[main_replica.op_id] = op.op_id
+            self.op_id_to_nvtx_range[main_replica.op_id] = nvtx.start_range(
+                f"schedule {main_replica.transfer_type.name}_MAIN_TXN_REPLICA "
+                f"op_id: {main_replica.op_id}, graph_id: {main_replica.graph_id}, "
+                f"worker_key={wk}",
+                color=get_nvtx_range_color(main_replica.graph_id))
+            op.pending_count += 1
+
+            self._maybe_submit_store_d2h_transaction(
+                wk=wk,
+                indexer_replica=indexer_replica,
+                indexer_worker=indexer_worker[wk],
+                main_replica=main_replica,
+                main_worker=main_worker[wk],
+            )
+            flexkv_logger.debug(
+                f"[TransferEngine][STORE-TXN] fan-out parent_op_id={op.op_id}, "
+                f"indexer_op_id={indexer_replica.op_id}, main_op_id={main_replica.op_id}, "
+                f"worker_key={wk}, pending_count={op.pending_count}"
+            )
+
+        return True
 
     def _assign_layerwise_op_to_workers(self, op: TransferOp) -> None:
         """Fan-out a LAYERWISE op symmetrically to every local PP-stage
@@ -1004,6 +1170,8 @@ class TransferEngine:
 
         if op.transfer_type == TransferType.LAYERWISE:
             self._assign_layerwise_op_to_workers(op)
+            return
+        if self._try_assign_d2h_store_transaction(op):
             return
         if self._has_indexer and op.transfer_type in self._indexer_worker_map:
             num_pages = op.src_block_ids.size
