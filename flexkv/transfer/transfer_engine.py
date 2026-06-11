@@ -18,7 +18,8 @@ import time
 import multiprocessing as mp
 import selectors
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import contextlib
 import nvtx
@@ -153,6 +154,17 @@ class TransferEngine:
 
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
+
+        # P800/standalone mitigation: large MAIN_KV_D2H launches can block for
+        # seconds when multiple stores overlap with decode/forward compute.  Keep
+        # at most N main-KV D2H child ops in flight per WorkerKey and queue the
+        # rest.  Indexer D2H remains independent and the parent op is finalized
+        # only when both indexer and main-KV children finish.
+        self._main_kv_d2h_inflight_limit = int(
+            os.environ.get("FLEXKV_MAIN_KV_D2H_INFLIGHT_LIMIT", "1")
+        )
+        self._main_kv_d2h_inflight: Dict[WorkerKey, int] = defaultdict(int)
+        self._pending_main_kv_d2h: Dict[WorkerKey, Deque[Tuple[TransferOp, WorkerHandle]]] = defaultdict(deque)
 
     def _init_workers(self) -> None:
         if self._running:
@@ -747,6 +759,7 @@ class TransferEngine:
                                     free_op_from_buffer(child_op, self.pin_buffer)
                                     if op_id in self.op_id_to_nvtx_range:
                                         nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
+                                    self._on_main_kv_d2h_child_finished(child_op)
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
@@ -859,6 +872,72 @@ class TransferEngine:
         ))
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
+
+    def _maybe_submit_main_kv_d2h(self, wk: WorkerKey, replica: TransferOp, worker: WorkerHandle) -> None:
+        """Submit or queue a MAIN_KV_D2H child op with per-WorkerKey backpressure.
+
+        This throttles only main-KV D2H children; indexer D2H and all H2D paths are
+        unchanged.  The child is already registered in child/parent maps and
+        contributes to the parent pending_count before this method is called.
+        """
+        if (
+            replica.transfer_type != TransferType.D2H
+            or self._main_kv_d2h_inflight_limit <= 0
+        ):
+            worker.submit_transfer(replica)
+            return
+
+        if self._main_kv_d2h_inflight[wk] < self._main_kv_d2h_inflight_limit:
+            self._main_kv_d2h_inflight[wk] += 1
+            worker.submit_transfer(replica)
+            flexkv_logger.debug(
+                f"[TransferEngine][D2H-BP] submit MAIN_KV_D2H replica_op_id={replica.op_id} "
+                f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
+                f"queued={len(self._pending_main_kv_d2h[wk])}"
+            )
+        else:
+            self._pending_main_kv_d2h[wk].append((replica, worker))
+            flexkv_logger.debug(
+                f"[TransferEngine][D2H-BP] queue MAIN_KV_D2H replica_op_id={replica.op_id} "
+                f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
+                f"queued={len(self._pending_main_kv_d2h[wk])}"
+            )
+
+    def _on_main_kv_d2h_child_finished(self, child_op: TransferOp) -> None:
+        """Release one MAIN_KV_D2H inflight slot and submit queued child ops."""
+        if child_op.transfer_type != TransferType.D2H or self._main_kv_d2h_inflight_limit <= 0:
+            return
+
+        # There is normally a single WorkerKey for the matching dp_client_id in
+        # standalone/TP8.  Use the same matching rule as submit-time.
+        worker_map = self._worker_map.get(TransferType.D2H)
+        if not isinstance(worker_map, dict):
+            return
+        sibling_keys = self._match_pp_siblings(worker_map, child_op.dp_client_id)
+        for wk in sibling_keys:
+            if self._main_kv_d2h_inflight[wk] > 0:
+                self._main_kv_d2h_inflight[wk] -= 1
+                flexkv_logger.debug(
+                    f"[TransferEngine][D2H-BP] finish MAIN_KV_D2H replica_op_id={child_op.op_id} "
+                    f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
+                    f"queued={len(self._pending_main_kv_d2h[wk])}"
+                )
+                self._drain_main_kv_d2h_queue(wk)
+                return
+
+    def _drain_main_kv_d2h_queue(self, wk: WorkerKey) -> None:
+        while (
+            self._main_kv_d2h_inflight[wk] < self._main_kv_d2h_inflight_limit
+            and self._pending_main_kv_d2h[wk]
+        ):
+            replica, worker = self._pending_main_kv_d2h[wk].popleft()
+            self._main_kv_d2h_inflight[wk] += 1
+            worker.submit_transfer(replica)
+            flexkv_logger.debug(
+                f"[TransferEngine][D2H-BP] drain MAIN_KV_D2H replica_op_id={replica.op_id} "
+                f"worker_key={wk}, inflight={self._main_kv_d2h_inflight[wk]}, "
+                f"queued={len(self._pending_main_kv_d2h[wk])}"
+            )
 
     @staticmethod
     def _match_pp_siblings(
@@ -1008,7 +1087,7 @@ class TransferEngine:
                     f"graph_id: {replica.graph_id}, worker_key={wk}",
                     color=get_nvtx_range_color(replica.graph_id))
                 op.pending_count += 1
-                worker[wk].submit_transfer(replica)
+                self._maybe_submit_main_kv_d2h(wk, replica, worker[wk])
                 flexkv_logger.debug(
                     f"[TransferEngine] MAIN_KV_{op.transfer_type.name} fan-out: "
                     f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
