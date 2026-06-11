@@ -58,6 +58,8 @@ inline double now_ms_path() {
 // Env compatibility:
 //   XSGL_TRANSFER_MERGED=1                -> force path2 merged path
 //   XSGL_TRANSFER_SEGMENT_THRESHOLD=N     -> path1/path2 threshold, default 8
+//   XSGL_TRANSFER_D2H_SEGMENT_THRESHOLD=N -> D2H-only threshold, default follows global
+//   XSGL_TRANSFER_H2D_SEGMENT_THRESHOLD=N -> H2D-only threshold, default follows global
 //   XSGL_TRANSFER_HUGEPAGE_MIN_BYTES=N    -> min thread-local staging buffer, default 288MB
 static bool is_transfer_merged_enabled() {
   static int enabled = -1;
@@ -81,6 +83,28 @@ static int64_t get_segment_count_threshold() {
       if (threshold <= 0) threshold = 8;
     } else {
       threshold = 8;
+    }
+  }
+  return threshold;
+}
+
+static int64_t get_directional_segment_count_threshold(bool is_host_to_device) {
+  // Keep SGLang-compatible global threshold, but allow D2H/H2D split tuning.
+  // This is useful on P800: D2H path1 launch loops are sensitive to compute
+  // overlap, while H2D path1 is usually fine.
+  static int64_t d2h_threshold = -1;
+  static int64_t h2d_threshold = -1;
+
+  int64_t &threshold = is_host_to_device ? h2d_threshold : d2h_threshold;
+  if (threshold < 0) {
+    const char *env = std::getenv(
+        is_host_to_device ? "XSGL_TRANSFER_H2D_SEGMENT_THRESHOLD"
+                          : "XSGL_TRANSFER_D2H_SEGMENT_THRESHOLD");
+    if (env && env[0] != '\0') {
+      threshold = std::atoll(env);
+      if (threshold <= 0) threshold = get_segment_count_threshold();
+    } else {
+      threshold = get_segment_count_threshold();
     }
   }
   return threshold;
@@ -318,7 +342,7 @@ void transfer_kv_blocks(
         int v = std::atoi(e);
         return (v == 0 || v == 1 || v == 2) ? v : -1;
       }();
-      const int64_t segment_threshold = get_segment_count_threshold();
+      const int64_t segment_threshold = get_directional_segment_count_threshold(is_host_to_device);
 
       // Step 1: scan ids on host to detect contiguity / segments.
       bool src_contig = false, dst_contig = false;
