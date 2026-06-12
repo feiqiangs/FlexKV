@@ -1,10 +1,15 @@
 #pragma once
 
+#include <condition_variable>
 #include <cuda_runtime.h>
+#include <exception>
 #include <fcntl.h>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <torch/extension.h>
 #include <vector>
 #include <sys/eventfd.h>
@@ -119,6 +124,27 @@ private:
   int num_layers_;
   std::vector<int> layer_eventfds_;  // Flat array
   int current_counter_id_;  // Current counter set index for this transfer
+
+  struct IssueWorkerState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::condition_variable done_cv;
+    std::function<void()> job;
+    std::exception_ptr exception;
+    std::thread thread;
+    bool has_job = false;
+    bool done = true;
+    bool stop = false;
+  };
+
+  bool use_persistent_issue_workers_ = false;
+  bool issue_workers_started_ = false;
+  std::vector<std::unique_ptr<IssueWorkerState>> issue_workers_;
+
+  void start_issue_workers_if_needed();
+  void stop_issue_workers();
+  void submit_issue_job(int gpu_idx, std::function<void()> job);
+  void wait_issue_job(int gpu_idx);
 
   void layer_done_callback(int start_layer, int layers_this_batch,
                            nvtxRangeId_t *current_range_id_ptr,

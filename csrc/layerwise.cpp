@@ -1,6 +1,7 @@
 #include "layerwise.h"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <stdexcept>
 #include <sys/eventfd.h>
@@ -167,6 +168,9 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     cudaEventCreate(&events_[i]);
   }
 
+  const char *issue_worker_env = std::getenv("FLEXKV_LAYERWISE_PERSISTENT_GPU_ISSUE");
+  use_persistent_issue_workers_ = issue_worker_env != nullptr && std::string(issue_worker_env) == "1";
+
   // Initialize SSD IO context if ssd_files is not empty
   enable_ssd_ = !ssd_files.empty();
   if (enable_ssd_) {
@@ -247,6 +251,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
+  stop_issue_workers();
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
@@ -269,6 +274,89 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     delete[] indexer_gpu_block_strides_in_bytes_;
     delete[] indexer_gpu_layer_strides_in_bytes_;
     delete[] indexer_gpu_chunk_sizes_in_bytes_;
+  }
+}
+
+void LayerwiseTransferGroup::start_issue_workers_if_needed() {
+  if (!use_persistent_issue_workers_ || issue_workers_started_) {
+    return;
+  }
+  issue_workers_.clear();
+  issue_workers_.reserve(num_gpus_);
+  for (int i = 0; i < num_gpus_; ++i) {
+    auto state = std::make_unique<IssueWorkerState>();
+    IssueWorkerState *raw = state.get();
+    raw->thread = std::thread([this, raw, i]() {
+      cudaSetDevice(gpu_device_ids_[i]);
+      while (true) {
+        std::function<void()> job;
+        {
+          std::unique_lock<std::mutex> lock(raw->mutex);
+          raw->cv.wait(lock, [&]() { return raw->stop || raw->has_job; });
+          if (raw->stop && !raw->has_job) {
+            return;
+          }
+          job = std::move(raw->job);
+          raw->has_job = false;
+          raw->done = false;
+          raw->exception = nullptr;
+        }
+        try {
+          job();
+        } catch (...) {
+          raw->exception = std::current_exception();
+        }
+        {
+          std::lock_guard<std::mutex> lock(raw->mutex);
+          raw->done = true;
+        }
+        raw->done_cv.notify_one();
+      }
+    });
+    issue_workers_.push_back(std::move(state));
+  }
+  issue_workers_started_ = true;
+  fprintf(stderr, "[LW-WORKER] started persistent per-GPU issue workers: num_gpus=%d\n", num_gpus_);
+}
+
+void LayerwiseTransferGroup::stop_issue_workers() {
+  if (!issue_workers_started_) {
+    return;
+  }
+  for (auto &state : issue_workers_) {
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->stop = true;
+    }
+    state->cv.notify_one();
+  }
+  for (auto &state : issue_workers_) {
+    if (state->thread.joinable()) {
+      state->thread.join();
+    }
+  }
+  issue_workers_.clear();
+  issue_workers_started_ = false;
+}
+
+void LayerwiseTransferGroup::submit_issue_job(int gpu_idx, std::function<void()> job) {
+  auto &state = issue_workers_[gpu_idx];
+  std::unique_lock<std::mutex> lock(state->mutex);
+  state->done_cv.wait(lock, [&]() { return state->done && !state->has_job; });
+  state->job = std::move(job);
+  state->done = false;
+  state->has_job = true;
+  state->exception = nullptr;
+  lock.unlock();
+  state->cv.notify_one();
+}
+
+void LayerwiseTransferGroup::wait_issue_job(int gpu_idx) {
+  auto &state = issue_workers_[gpu_idx];
+  std::unique_lock<std::mutex> lock(state->mutex);
+  state->done_cv.wait(lock, [&]() { return state->done; });
+  if (state->exception) {
+    std::rethrow_exception(state->exception);
   }
 }
 
@@ -333,6 +421,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
   // Set current counter ID for eventfd notification
   current_counter_id_ = counter_id;
+  start_issue_workers_if_needed();
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids =
@@ -478,8 +567,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     // Step 1: CPU -> GPU transfer
     // NVTX range for this batch was already started (by main thread for first batch,
     // or by previous batch's callback for subsequent batches)
-    
-    for (int i = 0; i < num_gpus_; ++i) {
+    auto issue_one_gpu = [&](int i) {
       cudaSetDevice(gpu_device_ids_[i]);
       int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
       if (is_mla) {
@@ -567,6 +655,19 @@ void LayerwiseTransferGroup::layerwise_transfer(
               use_ce_transfer, true /* is_mla */, false /* sync */);
           break;
         }
+      }
+    };
+
+    if (use_persistent_issue_workers_) {
+      for (int i = 0; i < num_gpus_; ++i) {
+        submit_issue_job(i, [&, i]() { issue_one_gpu(i); });
+      }
+      for (int i = 0; i < num_gpus_; ++i) {
+        wait_issue_job(i);
+      }
+    } else {
+      for (int i = 0; i < num_gpus_; ++i) {
+        issue_one_gpu(i);
       }
     }
 

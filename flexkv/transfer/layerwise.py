@@ -555,6 +555,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         )
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
+        detail_timing = os.environ.get("FLEXKV_LAYERWISE_DETAIL_TIMING", "0") == "1"
+        t0 = time.time()
+
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
         dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
 
@@ -564,6 +567,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             src_block_ids_disk2h = None
             dst_block_ids_disk2h = None
+        t_block_ids_ready = time.time()
 
         # Extract indexer block_ids if available
         indexer_src_block_ids = None
@@ -573,8 +577,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 transfer_op.indexer_src_block_ids).to(dtype=torch.int64).pin_memory()
             indexer_dst_block_ids = torch.from_numpy(
                 transfer_op.indexer_dst_block_ids).to(dtype=torch.int64).pin_memory()
+        t_indexer_ready = time.time()
 
         num_h2d_blocks = len(src_block_ids_h2d)
+        num_d2h_blocks = 0 if src_block_ids_disk2h is None else len(src_block_ids_disk2h)
+        num_indexer_blocks = 0 if indexer_src_block_ids is None else len(indexer_src_block_ids)
 
         start_time = time.time()
         self._transfer_impl(
@@ -591,15 +598,36 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         # P800/XPU: CUDA host callbacks (cudaLaunchHostFunc) may not fire on
         # non-NVIDIA platforms. Write eventfds from Python after transfer completes
         # to ensure sglang's _layer_done_counter receives the notification.
+        t_eventfd_start = time.time()
         if self._layer_eventfds_list:
             counter_id = transfer_op.counter_id
             for layer_id in range(self.num_layers):
                 self._write_layer_eventfds(counter_id, layer_id)
+        t_eventfd_done = time.time()
 
         transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * self.kv_dim
 
         if self.is_mla:
             transfer_size *= self.tp_group_size
+
+        if detail_timing:
+            total_time = t_eventfd_done - t0
+            prepare_ms = (t_block_ids_ready - t0) * 1000.0
+            indexer_prepare_ms = (t_indexer_ready - t_block_ids_ready) * 1000.0
+            transfer_impl_ms = (end_time - start_time) * 1000.0
+            eventfd_ms = (t_eventfd_done - t_eventfd_start) * 1000.0
+            total_ms = total_time * 1000.0
+            bandwidth = transfer_size / max(end_time - start_time, 1e-6) / 1e9
+            flexkv_logger.info(
+                f"[LW-DETAIL] op={transfer_op.transfer_op_id} counter={transfer_op.counter_id} "
+                f"h2d_blocks={num_h2d_blocks} d2h_blocks={num_d2h_blocks} "
+                f"indexer_blocks={num_indexer_blocks} layers={self.num_layers} "
+                f"size={transfer_size/(1024**3):.3f}GB "
+                f"prepare={prepare_ms:.1f}ms indexer_prepare={indexer_prepare_ms:.1f}ms "
+                f"transfer_impl={transfer_impl_ms:.1f}ms eventfd={eventfd_ms:.1f}ms "
+                f"total={total_ms:.1f}ms impl_bw={bandwidth:.2f}GB/s "
+                f"eventfds={len(self._layer_eventfds_list)} enable_indexer={self.enable_indexer}"
+            )
 
         self._log_transfer_performance(
             transfer_op,
