@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cerrno>
+#include <memory>
 #include <string>
 #include <sys/mman.h>
 
@@ -110,6 +111,19 @@ static int64_t get_directional_segment_count_threshold(bool is_host_to_device) {
   return threshold;
 }
 
+// Env gate for H2D path1 segment-level ping-pong (mirrors SGLang hicache).
+// When enabled (default, can be set to 0 to disable), the H2D path1 uses a
+// double-buffered hugepage staging buffer so CPU gather of segment K+1
+// overlaps with H2D of segment K.
+static bool is_h2d_path1_pingpong_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *env = std::getenv("FLEXKV_H2D_PATH1_PINGPONG");
+    enabled = (env && std::string(env) == "0") ? 0 : 1;
+  }
+  return enabled == 1;
+}
+
 static size_t get_hugepage_default_min_bytes() {
   static size_t default_bytes = 0;
   if (default_bytes == 0) {
@@ -192,24 +206,40 @@ static void *get_cached_hugepage_buffer(size_t needed_size) {
 struct CudaEventPairHolder {
   cudaEvent_t events[2] = {nullptr, nullptr};
   bool initialized = false;
-  void ensure_init() {
+  int device_id = -1;
+  void ensure_init(int device) {
     if (initialized) return;
+    device_id = device;
+    cudaSetDevice(device_id);
     cudaEventCreateWithFlags(&events[0], cudaEventDisableTiming | cudaEventBlockingSync);
     cudaEventCreateWithFlags(&events[1], cudaEventDisableTiming | cudaEventBlockingSync);
     initialized = true;
   }
   ~CudaEventPairHolder() {
     if (initialized) {
+      int prev_device = 0;
+      cudaGetDevice(&prev_device);
+      if (device_id >= 0) cudaSetDevice(device_id);
       if (events[0]) cudaEventDestroy(events[0]);
       if (events[1]) cudaEventDestroy(events[1]);
+      if (device_id >= 0) cudaSetDevice(prev_device);
     }
   }
 };
 
 static cudaEvent_t *get_cached_pingpong_events() {
-  static thread_local CudaEventPairHolder holder;
-  holder.ensure_init();
-  return holder.events;
+  int current_device = 0;
+  cudaGetDevice(&current_device);
+  static thread_local std::vector<std::unique_ptr<CudaEventPairHolder>> holders;
+  if (current_device < 0) current_device = 0;
+  if (static_cast<size_t>(current_device) >= holders.size()) {
+    holders.resize(static_cast<size_t>(current_device) + 1);
+  }
+  if (!holders[current_device]) {
+    holders[current_device] = std::make_unique<CudaEventPairHolder>();
+  }
+  holders[current_device]->ensure_init(current_device);
+  return holders[current_device]->events;
 }
 
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
@@ -424,31 +454,94 @@ void transfer_kv_blocks(
         double _t_seg_done = _ptiming ? now_ms_path() : 0.0;
         size_t _seg_count = segments.size();
 
-        for (int i = 0; i < num_layers; i++) {
-          for (int j = 0; j < kv_dim; j++) {
-            for (auto &seg : segments) {
-              int sk = seg.first;
-              int run = seg.second;
-              int64_t seg_size = chunk_size_in_bytes * run;
-              int64_t *cpu_chunk_ptr =
-                  cpu_ptr_int64 +
-                  (i + start_layer_id) * cpu_layer_stride_int64 +
-                  j * cpu_kv_stride_int64 +
-                  cpu_block_ids[sk] * cpu_block_stride_int64 +
-                  cpu_startoff_inside_chunks_int64;
-              int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                              i + start_layer_id, j,
-                                              gpu_block_ids[sk]);
-              int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
-                                       gpu_startoff_inside_chunks_int64;
-              if (is_host_to_device) {
-                cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, seg_size,
+        if (is_host_to_device && is_h2d_path1_pingpong_enabled()) {
+          // ---- H2D path1 with segment-level ping-pong (mirrors SGLang hicache) ----
+          // Allocate double-buffered hugepage staging so CPU gather of seg K+1
+          // overlaps with H2D of seg K. Each segment is gathered from cpu_ptr
+          // into a staging slot, then one cudaMemcpyAsync H2D issues; while
+          // the GPU DMA runs, the CPU gathers the next segment into the other
+          // slot. When a slot is needed again, we wait for its H2D to finish.
+          const size_t max_seg_bytes =
+              static_cast<size_t>(num_blocks) * static_cast<size_t>(chunk_size_in_bytes);
+          void *host_base = get_cached_hugepage_buffer(max_seg_bytes * 2);
+          TORCH_CHECK(host_base != nullptr,
+                      "path1 H2D staging buffer allocation failed");
+          void *host_bufs[2] = {
+              host_base,
+              static_cast<char *>(host_base) + max_seg_bytes,
+          };
+          cudaEvent_t *pp_events = get_cached_pingpong_events();
+          bool event_used[2] = {false, false};
+
+          for (int i = 0; i < num_layers; i++) {
+            for (int j = 0; j < kv_dim; j++) {
+              int seg_idx = 0;
+              for (auto &seg : segments) {
+                int sk = seg.first;
+                int run = seg.second;
+                int64_t seg_size = chunk_size_in_bytes * run;
+                const int idx = seg_idx & 1;
+
+                // Wait for previous use of this buffer slot to finish.
+                if (event_used[idx]) {
+                  cudaEventSynchronize(pp_events[idx]);
+                }
+
+                // CPU gather: copy from cpu blocks into staging buffer.
+                int64_t *cpu_chunk_ptr =
+                    cpu_ptr_int64 +
+                    (i + start_layer_id) * cpu_layer_stride_int64 +
+                    j * cpu_kv_stride_int64 +
+                    cpu_block_ids[sk] * cpu_block_stride_int64 +
+                    cpu_startoff_inside_chunks_int64;
+                std::memcpy(host_bufs[idx], cpu_chunk_ptr,
+                            static_cast<size_t>(seg_size));
+
+                // H2D from staging buffer to GPU.
+                int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                                i + start_layer_id, j,
+                                                gpu_block_ids[sk]);
+                int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
+                                         gpu_startoff_inside_chunks_int64;
+                cudaMemcpyAsync(gpu_chunk_ptr, host_bufs[idx], seg_size,
                                 cudaMemcpyHostToDevice, stream);
-              } else {
-                cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, seg_size,
-                                cudaMemcpyDeviceToHost, stream);
+                cudaEventRecord(pp_events[idx], stream);
+                event_used[idx] = true;
+                FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
+                seg_idx++;
               }
-              FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, seg_size);
+            }
+          }
+          // Flush remaining in-flight H2D segments.
+          if (event_used[0]) cudaEventSynchronize(pp_events[0]);
+          if (event_used[1]) cudaEventSynchronize(pp_events[1]);
+        } else {
+          for (int i = 0; i < num_layers; i++) {
+            for (int j = 0; j < kv_dim; j++) {
+              for (auto &seg : segments) {
+                int sk = seg.first;
+                int run = seg.second;
+                int64_t seg_size = chunk_size_in_bytes * run;
+                int64_t *cpu_chunk_ptr =
+                    cpu_ptr_int64 +
+                    (i + start_layer_id) * cpu_layer_stride_int64 +
+                    j * cpu_kv_stride_int64 +
+                    cpu_block_ids[sk] * cpu_block_stride_int64 +
+                    cpu_startoff_inside_chunks_int64;
+                int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                                i + start_layer_id, j,
+                                                gpu_block_ids[sk]);
+                int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
+                                         gpu_startoff_inside_chunks_int64;
+                if (is_host_to_device) {
+                  cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, seg_size,
+                                  cudaMemcpyHostToDevice, stream);
+                } else {
+                  cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, seg_size,
+                                  cudaMemcpyDeviceToHost, stream);
+                }
+                FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, seg_size);
+              }
             }
           }
         }
