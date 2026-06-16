@@ -124,6 +124,20 @@ static bool is_h2d_path1_pingpong_enabled() {
   return enabled == 1;
 }
 
+// Env gate for D2H path1 layer-level ping-pong (mirrors hicache MLA-CE
+// transfer_kv_all_layer_mla_lf_pf_direct_ce path1).
+// When enabled (default, can be set to 0 to disable), the D2H path1 uses
+// a double-buffered hugepage staging buffer so D2H of layer L+1 overlaps
+// with CPU scatter of layer L.
+static bool is_d2h_path1_pingpong_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *env = std::getenv("FLEXKV_D2H_PATH1_PINGPONG");
+    enabled = (env && std::string(env) == "0") ? 0 : 1;
+  }
+  return enabled == 1;
+}
+
 static size_t get_hugepage_default_min_bytes() {
   static size_t default_bytes = 0;
   if (default_bytes == 0) {
@@ -515,6 +529,100 @@ void transfer_kv_blocks(
           // Flush remaining in-flight H2D segments.
           if (event_used[0]) cudaEventSynchronize(pp_events[0]);
           if (event_used[1]) cudaEventSynchronize(pp_events[1]);
+        } else if (!is_host_to_device && is_d2h_path1_pingpong_enabled()) {
+          // -- D2H path1 with layer-level ping-pong (mirrors hicache MLA-CE
+          //    transfer_kv_all_layer_mla_lf_pf_direct_ce path1) --
+          // Double-buffered hugepage staging: D2H of layer L+1 overlaps with
+          // CPU scatter of layer L.  All segments for one (layer,kv) are
+          // D2H-ed into a contiguous staging slot, then while the GPU
+          // processes the next slot the CPU scatters the previous one into
+          // the final cpu_ptr positions.
+          const size_t layer_buf_bytes =
+              static_cast<size_t>(num_blocks) * static_cast<size_t>(chunk_size_in_bytes);
+          void *host_base = get_cached_hugepage_buffer(layer_buf_bytes * 2);
+          TORCH_CHECK(host_base != nullptr,
+                      "path1 D2H staging buffer allocation failed");
+          void *host_bufs[2] = {
+              host_base,
+              static_cast<char *>(host_base) + layer_buf_bytes,
+          };
+          cudaEvent_t *pp_events = get_cached_pingpong_events();
+
+          const int64_t total_iters =
+              static_cast<int64_t>(num_layers) * static_cast<int64_t>(kv_dim);
+          for (int64_t it = 0; it < total_iters; ++it) {
+            const int layer_i = static_cast<int>(it / kv_dim);
+            const int kv_j   = static_cast<int>(it % kv_dim);
+            const int idx    = static_cast<int>(it & 1);
+            void *buf = host_bufs[idx];
+
+            // D2H all segments for this (layer,kv) into staging buf.
+            int64_t seg_offset = 0;
+            for (auto &seg : segments) {
+              int sk = seg.first;
+              int run = seg.second;
+              int64_t seg_size = chunk_size_in_bytes * run;
+              int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                              layer_i + start_layer_id, kv_j,
+                                              gpu_block_ids[sk]);
+              int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
+                                       gpu_startoff_inside_chunks_int64;
+              char *staging_dst = static_cast<char *>(buf) + seg_offset;
+              cudaMemcpyAsync(staging_dst, gpu_chunk_ptr, seg_size,
+                              cudaMemcpyDeviceToHost, stream);
+              seg_offset += seg_size;
+              FLEXKV_GPU_CPU_TRANSFER(false, seg_size);
+            }
+            cudaEventRecord(pp_events[idx], stream);
+
+            // Overlap: CPU scatter the PREVIOUS (layer,kv) while GPU
+            // executes D2H for the current one.
+            if (it >= 1) {
+              const int prev_idx = static_cast<int>((it - 1) & 1);
+              cudaEventSynchronize(pp_events[prev_idx]);
+              const int prev_layer = static_cast<int>((it - 1) / kv_dim);
+              const int prev_kv    = static_cast<int>((it - 1) % kv_dim);
+              int64_t scatter_off = 0;
+              for (auto &seg : segments) {
+                int sk = seg.first;
+                int run = seg.second;
+                int64_t seg_size = chunk_size_in_bytes * run;
+                int64_t *cpu_dst =
+                    cpu_ptr_int64 +
+                    (prev_layer + start_layer_id) * cpu_layer_stride_int64 +
+                    prev_kv * cpu_kv_stride_int64 +
+                    cpu_block_ids[sk] * cpu_block_stride_int64 +
+                    cpu_startoff_inside_chunks_int64;
+                std::memcpy(cpu_dst,
+                            static_cast<char *>(host_bufs[prev_idx]) + scatter_off,
+                            static_cast<size_t>(seg_size));
+                scatter_off += seg_size;
+              }
+            }
+          }
+          // Flush the final (layer,kv).
+          if (total_iters >= 1) {
+            const int last_idx = static_cast<int>((total_iters - 1) & 1);
+            cudaEventSynchronize(pp_events[last_idx]);
+            const int last_layer = static_cast<int>((total_iters - 1) / kv_dim);
+            const int last_kv    = static_cast<int>((total_iters - 1) % kv_dim);
+            int64_t scatter_off = 0;
+            for (auto &seg : segments) {
+              int sk = seg.first;
+              int run = seg.second;
+              int64_t seg_size = chunk_size_in_bytes * run;
+              int64_t *cpu_dst =
+                  cpu_ptr_int64 +
+                  (last_layer + start_layer_id) * cpu_layer_stride_int64 +
+                  last_kv * cpu_kv_stride_int64 +
+                  cpu_block_ids[sk] * cpu_block_stride_int64 +
+                  cpu_startoff_inside_chunks_int64;
+              std::memcpy(cpu_dst,
+                          static_cast<char *>(host_bufs[last_idx]) + scatter_off,
+                          static_cast<size_t>(seg_size));
+              scatter_off += seg_size;
+            }
+          }
         } else {
           for (int i = 0; i < num_layers; i++) {
             for (int j = 0; j < kv_dim; j++) {
