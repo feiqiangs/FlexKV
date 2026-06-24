@@ -1,6 +1,7 @@
 import ctypes
 import mmap
 import os
+import uuid
 import weakref
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -106,12 +107,64 @@ class CPUAllocator(BaseStorageAllocator):
             f"{total_size * dtype.itemsize / 1024 / 1024 / 1024:.4f} GB "
             f"(elements={total_size}, dtype={dtype})"
         )
-        physical_tensor = torch.empty(
-                            size=(total_size,),
-                            dtype=dtype,
-                            device="cpu",
-                            pin_memory=False,
-                        )
+
+        # Use mmap + madvise(MADV_HUGEPAGE) + cudaHostRegister — same as sglang
+        # transfer.cc alloc_hugepage_memory(). THP gives 2MB pages without
+        # requiring MAP_HUGETLB / hugetlbfs, and cudaHostRegister succeeds
+        # (unlike MAP_HUGETLB memory) enabling async DMA for D2H/H2D.
+        pin_memory = kwargs.get("pin_memory", False)
+        num_bytes = total_size * dtype.itemsize
+        aligned_bytes = (num_bytes + 4095) & ~4095
+
+        ptr = _libc.mmap(
+            None, aligned_bytes,
+            _PROT_READ | _PROT_WRITE,
+            _MAP_PRIVATE | _MAP_ANONYMOUS,
+            -1, 0,
+        )
+        if ptr == _MAP_FAILED:
+            raise RuntimeError(
+                f"CPUAllocator mmap failed (size={aligned_bytes}): "
+                f"{os.strerror(ctypes.get_errno())}"
+            )
+
+        if _libc.madvise(ptr, aligned_bytes, _MADV_HUGEPAGE) != 0:
+            flexkv_logger.warning(
+                f"CPUAllocator madvise(MADV_HUGEPAGE) failed "
+                f"(ptr={ptr}, size={aligned_bytes}): "
+                f"{os.strerror(ctypes.get_errno())}"
+            )
+        else:
+            flexkv_logger.info(
+                f"CPUAllocator THP madvise OK (ptr={ptr}, "
+                f"size={aligned_bytes / 1024 / 1024 / 1024:.4f} GB)"
+            )
+
+        if pin_memory:
+            try:
+                err = torch.cuda.cudart().cudaHostRegister(ptr, aligned_bytes, 0)
+                if isinstance(err, tuple):
+                    err = err[0]
+                if err != 0:
+                    flexkv_logger.warning(
+                        f"CPUAllocator cudaHostRegister failed (err={err}), "
+                        f"continuing without pinning"
+                    )
+                else:
+                    flexkv_logger.info(
+                        f"CPUAllocator cudaHostRegister OK (ptr={ptr}, "
+                        f"size={aligned_bytes / 1024 / 1024 / 1024:.4f} GB)"
+                    )
+            except Exception as e:
+                flexkv_logger.warning(
+                    f"CPUAllocator cudaHostRegister exception: {e}"
+                )
+
+        physical_tensor = torch.frombuffer(
+            (ctypes.c_char * num_bytes).from_address(ptr),
+            dtype=dtype,
+        ).reshape(total_size)
+
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
             data=physical_tensor,
@@ -168,6 +221,11 @@ _libc.ftruncate.restype = ctypes.c_int
 _libc.ftruncate.argtypes = [ctypes.c_int, ctypes.c_long]
 _libc.close.restype = ctypes.c_int
 _libc.close.argtypes = [ctypes.c_int]
+
+# THP (Transparent Huge Pages) via madvise — same approach as sglang transfer.cc
+_MADV_HUGEPAGE = 14
+_libc.madvise.restype = ctypes.c_int
+_libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 
 
 class _StatFS(ctypes.Structure):
@@ -265,7 +323,7 @@ def _ensure_hugetlbfs_mount(mnt_dir: str) -> None:
 def _create_hugetlbfs_file(aligned: int) -> tuple[str, int]:
     mnt_dir = os.environ.get("FLEXKV_HUGETLBFS_DIR", DEFAULT_HUGETLBFS_DIR)
     _ensure_hugetlbfs_mount(mnt_dir)
-    path = os.path.join(mnt_dir, f"flexkv_hugepage_{os.getpid()}_{id(object()):x}")
+    path = os.path.join(mnt_dir, f"flexkv_hugepage_{os.getpid()}_{uuid.uuid4().hex}")
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
     try:
         ctypes.set_errno(0)

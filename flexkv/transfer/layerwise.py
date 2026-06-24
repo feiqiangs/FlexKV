@@ -152,7 +152,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker] Pinning CPU Memory: "
                            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        try:
+            cudaHostRegister(cpu_blocks)
+        except RuntimeError as e:
+            flexkv_logger.warning(f"cudaHostRegister failed for LayerwiseWorker CPU cache (hugepage memory not supported by CUDA), continuing without pinning: {e}")
         flexkv_logger.debug("[LayerwiseWorker] CPU memory pinned successfully")
         self.cpu_blocks = cpu_blocks
 
@@ -223,7 +226,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             flexkv_logger.info(
                 f"[LayerwiseWorker] Pinning indexer CPU Memory: "
                 f"{indexer_cpu_blocks.numel() * indexer_cpu_blocks.element_size() / (1024 ** 3):.4f} GB")
-            cudaHostRegister(indexer_cpu_blocks)
+            try:
+                cudaHostRegister(indexer_cpu_blocks)
+            except RuntimeError as e:
+                flexkv_logger.warning(f"cudaHostRegister failed for LayerwiseWorker indexer CPU cache (hugepage memory not supported by CUDA), continuing without pinning: {e}")
 
             # Compute indexer GPU stride tensors
             indexer_gpu_kv_strides = [layout.get_kv_stride() * indexer_dtype.itemsize

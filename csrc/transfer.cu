@@ -389,10 +389,19 @@ void transfer_kv_blocks(
       const int64_t segment_threshold = get_directional_segment_count_threshold(is_host_to_device);
 
       // Step 1: scan ids on host to detect contiguity / segments.
+      // compute_segments sets:
+      //   src_contig  = gpu_block_ids contiguous (GPU-side)
+      //   dst_contig  = cpu_block_ids contiguous (CPU-side)
+      // This naming is correct for D2H (GPU=src, CPU=dst), but for H2D the
+      // actual data source is CPU and destination is GPU, so we swap the two
+      // flags for H2D to keep the rest of the code semantically consistent.
       bool src_contig = false, dst_contig = false;
       int64_t num_segments = 0;
       compute_segments(gpu_block_ids, cpu_block_ids, num_blocks, src_contig,
                        dst_contig, num_segments);
+      if (is_host_to_device) {
+        std::swap(src_contig, dst_contig);
+      }
 
       // Step 2: choose path (mirrors SGLang transfer_kv_all_layer_mla_ce).
       //   Path 0: BOTH sides logically contiguous -> single memcpy per
@@ -410,9 +419,23 @@ void transfer_kv_blocks(
         // Match SGLang XSGL_TRANSFER_MERGED behavior: force merged path for testing/optimization.
         chosen_path = 2;
       }
+      // When block_stride != chunk_size (e.g. sharded D2H where chunk_size =
+      // gpu_chunk/num_gpus but block_stride = gpu_chunk), Path 0's single big
+      // memcpy crosses block boundaries and corrupts data. Redirect to Path 1
+      // which correctly uses per-segment offsets. Path 2 is only needed when
+      // there are too many segments.
+      if (cpu_block_stride_in_bytes != chunk_size_in_bytes && chosen_path == 0) {
+        chosen_path = 1;
+      }
 
       // ----- Path 0: single big memcpy per (layer, kv_dim) -----
-      if (chosen_path == 0) {
+      // Only valid when blocks are physically contiguous in CPU memory
+      // (block_stride == chunk_size). When block_stride > chunk_size (e.g.
+      // sharded D2H where chunk_size = gpu_chunk/num_gpus but block_stride =
+      // gpu_chunk), a single big memcpy would write across block boundaries
+      // and corrupt data.
+      if (chosen_path == 0 &&
+          cpu_block_stride_in_bytes == chunk_size_in_bytes) {
         int64_t big_size = chunk_size_in_bytes * num_blocks;
         for (int i = 0; i < num_layers; i++) {
           for (int j = 0; j < kv_dim; j++) {
@@ -439,7 +462,7 @@ void transfer_kv_blocks(
         }
       }
       // ----- Path 1: per-segment memcpy -----
-      else if (chosen_path == 1) {
+      else if (chosen_path == 1 || chosen_path == 0) {
         // [PATCH 06-10] path 1 inner timing
         const bool _ptiming = inner_path_timing_enabled();
         double _t0 = _ptiming ? now_ms_path() : 0.0;
@@ -468,7 +491,13 @@ void transfer_kv_blocks(
         double _t_seg_done = _ptiming ? now_ms_path() : 0.0;
         size_t _seg_count = segments.size();
 
-        if (is_host_to_device && is_h2d_path1_pingpong_enabled()) {
+        // Ping-pong is only beneficial in batch mode (num_layers > 1) where
+        // layer-to-layer overlap is possible. In layerwise mode (num_layers
+        // == 1), ping-pong adds cudaEventSynchronize overhead with zero
+        // overlap benefit, and the local event_used reset across calls can
+        // cause staging buffer corruption when the previous layer's H2D DMA
+        // is still reading the thread-local cached host_bufs.
+        if (is_host_to_device && is_h2d_path1_pingpong_enabled() && num_layers > 1) {
           // ---- H2D path1 with segment-level ping-pong (mirrors SGLang hicache) ----
           // Allocate double-buffered hugepage staging so CPU gather of seg K+1
           // overlaps with H2D of seg K. Each segment is gathered from cpu_ptr
@@ -529,7 +558,7 @@ void transfer_kv_blocks(
           // Flush remaining in-flight H2D segments.
           if (event_used[0]) cudaEventSynchronize(pp_events[0]);
           if (event_used[1]) cudaEventSynchronize(pp_events[1]);
-        } else if (!is_host_to_device && is_d2h_path1_pingpong_enabled()) {
+        } else if (!is_host_to_device && is_d2h_path1_pingpong_enabled() && num_layers > 1) {
           // -- D2H path1 with layer-level ping-pong (mirrors hicache MLA-CE
           //    transfer_kv_all_layer_mla_lf_pf_direct_ce path1) --
           // Double-buffered hugepage staging: D2H of layer L+1 overlaps with
@@ -669,26 +698,20 @@ void transfer_kv_blocks(
         }
       }
       // ----- Path 2: gather/scatter pipeline (mirrors SGLang Path 2) -----
-      //   D2H direction:
-      //     - if !src_contig: GPU index_select gathers blocks into a device
-      //       buffer; otherwise D2H reads the source pool directly.
-      //     - if !dst_contig: D2H writes into a host pinned staging buffer
-      //       and a CPU memcpy scatters segments into the final cpu_ptr;
-      //       otherwise D2H writes directly to the final cpu_ptr.
-      //   H2D direction:
-      //     - if !src_contig: CPU memcpy gathers blocks from the cpu_ptr
-      //       into a host pinned staging buffer; otherwise H2D reads the
-      //       cpu_ptr directly.
-      //     - if !dst_contig: H2D writes into a device buffer, then a GPU
-      //       index_copy_ scatters into the final dst; otherwise H2D writes
-      //       directly to the final GPU pool.
-      //   Ping-pong with two CUDA events overlaps GPU work for (layer L+1,
-      //   kv j) with CPU work for (layer L, kv j) when staging is needed.
-      //
-      // Process iterates over (layer, kv) pairs because FlexKV's kv pool is
-      // {num_layers, kv_dim, num_blocks, chunk}. For MLA kv_dim==1, so the
-      // loop is effectively per-layer and matches SGLang exactly.
+      //   When block_stride != chunk_size (e.g. sharded D2H), we force
+      //   non-contiguous treatment so per-block scatter/gather is used.
+      //   ...
       else {
+        // When block_stride != chunk_size, force CPU-side non-contig so the
+        // per-block scatter/gather (which correctly uses block_stride) is used.
+        // GPU-side contiguity is preserved for the D2H/H2D staging transfer.
+        if (cpu_block_stride_in_bytes != chunk_size_in_bytes) {
+          if (is_host_to_device) {
+            src_contig = false;  // H2D: CPU src needs per-block gather
+          } else {
+            dst_contig = false;  // D2H: CPU dst needs per-block scatter
+          }
+        }
         // ---- Pre-compute helpers -----------------------------------------
         // chunk size measured in int64 elements (chunk size is guaranteed
         // multiple of 8 because callers built it from float4-aligned strides).
@@ -774,22 +797,38 @@ void transfer_kv_blocks(
               (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
               kv_idx * cpu_kv_stride_int64 +
               cpu_startoff_inside_chunks_int64;
-          int sb = 0;
-          while (sb < num_blocks) {
-            int se = sb + 1;
-            while (se < num_blocks &&
-                   cpu_block_ids[se] == cpu_block_ids[se - 1] + 1) {
-              ++se;
+          // When block_stride == chunk_size, blocks are physically contiguous
+          // and we can do per-segment bulk memcpy. When block_stride !=
+          // chunk_size (e.g. sharded D2H), each block must be copied
+          // individually to block_ids[k] * block_stride.
+          if (cpu_block_stride_in_bytes == chunk_size_in_bytes) {
+            int sb = 0;
+            while (sb < num_blocks) {
+              int se = sb + 1;
+              while (se < num_blocks &&
+                     cpu_block_ids[se] == cpu_block_ids[se - 1] + 1) {
+                ++se;
+              }
+              const int run = se - sb;
+              const char *src =
+                  static_cast<const char *>(staging_base) +
+                  static_cast<int64_t>(sb) * chunk_size_in_bytes;
+              int64_t *dst =
+                  cpu_layer_kv_base +
+                  cpu_block_ids[sb] * cpu_block_stride_int64;
+              std::memcpy(dst, src, static_cast<size_t>(run) * chunk_size_in_bytes);
+              sb = se;
             }
-            const int run = se - sb;
-            const char *src =
-                static_cast<const char *>(staging_base) +
-                static_cast<int64_t>(sb) * chunk_size_in_bytes;
-            int64_t *dst =
-                cpu_layer_kv_base +
-                cpu_block_ids[sb] * cpu_block_stride_int64;
-            std::memcpy(dst, src, static_cast<size_t>(run) * chunk_size_in_bytes);
-            sb = se;
+          } else {
+            for (int k = 0; k < num_blocks; ++k) {
+              const char *src =
+                  static_cast<const char *>(staging_base) +
+                  static_cast<int64_t>(k) * chunk_size_in_bytes;
+              int64_t *dst =
+                  cpu_layer_kv_base +
+                  cpu_block_ids[k] * cpu_block_stride_int64;
+              std::memcpy(dst, src, static_cast<size_t>(chunk_size_in_bytes));
+            }
           }
         };
 

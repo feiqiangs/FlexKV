@@ -239,7 +239,7 @@ class StorageEngine:
         storage_handle: StorageHandle
         if device_type == DeviceType.CPU:
             cpu_allocator = self._cpu_allocator()
-            pin_memory = kwargs.get('pin_memory', False)
+            pin_memory = kwargs.get('pin_memory', True)  # default True for THP+cudaHostRegister
             page_size_bytes = kwargs.get(
                 'page_size_bytes',
                 self._cache_config.hugepage_size_bytes,
