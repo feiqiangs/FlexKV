@@ -6,6 +6,7 @@ from torch.multiprocessing import Queue as MPQueue
 from multiprocessing.connection import Connection
 from typing import List, Any, Dict, Union, Optional, Tuple
 
+import numpy as np
 import torch
 
 from flexkv.c_ext import LayerwiseTransferGroup
@@ -588,6 +589,28 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         num_h2d_blocks = len(src_block_ids_h2d)
         num_d2h_blocks = 0 if src_block_ids_disk2h is None else len(src_block_ids_disk2h)
         num_indexer_blocks = 0 if indexer_src_block_ids is None else len(indexer_src_block_ids)
+
+        # [DEBUG-BATCH] Log batch H2D block_ids for corruption analysis
+        if os.environ.get("FLEXKV_DEBUG_BATCH_H2D", "0") == "1" and num_h2d_blocks > 0:
+            cpu_ids = transfer_op.src_block_ids_h2d
+            gpu_ids = transfer_op.dst_block_ids_h2d
+            # Check for duplicate cpu_block_ids (shared prefix across requests)
+            unique_cpu, cpu_counts = np.unique(cpu_ids, return_counts=True)
+            dups = unique_cpu[cpu_counts > 1]
+            has_dup = len(dups) > 0
+            # Check contiguity
+            cpu_contig = np.all(np.diff(cpu_ids) == 1)
+            gpu_contig = np.all(np.diff(gpu_ids) == 1)
+            import sys
+            print(f"[BATCH-H2D-DBG] num_blocks={num_h2d_blocks} "
+                  f"cpu_contig={cpu_contig} gpu_contig={gpu_contig} "
+                  f"has_dup_cpu={has_dup} dup_count={len(dups)} "
+                  f"cpu_ids[:10]={cpu_ids[:10]} gpu_ids[:10]={gpu_ids[:10]} "
+                  f"cpu_ids[-5:]={cpu_ids[-5:]} gpu_ids[-5:]={gpu_ids[-5:]}",
+                  file=sys.stderr, flush=True)
+            if has_dup:
+                print(f"[BATCH-H2D-DBG] DUP cpu_block_ids: {dups[:10]}",
+                      file=sys.stderr, flush=True)
 
         start_time = time.time()
         self._transfer_impl(

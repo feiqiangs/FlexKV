@@ -418,6 +418,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        self.cpu_blocks = cpu_blocks  # Keep reference for debug
         # Handle tensor import for multi-process case
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
@@ -537,6 +538,58 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
 
+    def _safe_checksum(self, block_ids, label, op_id, is_gpu):
+        """Safe checksum that never throws - wrapped in try-except."""
+        if not os.environ.get("FLEXKV_CHECKSUM_DEBUG", "0") == "1":
+            return
+        try:
+            ids = block_ids.tolist() if hasattr(block_ids, 'tolist') else list(block_ids)
+            if len(ids) == 0:
+                return
+            n = len(ids)
+            sample = sorted(set([0, n//4, n//2, 3*n//4, n-1]))
+            if is_gpu:
+                t = self.gpu_blocks[0][0]
+                chunk_elems = self.gpu_chunk_sizes_in_bytes[0] // self.dtype.itemsize
+                flat = t.flatten()
+                for si in sample:
+                    bid = ids[si]
+                    start = bid * chunk_elems
+                    end = min(start + chunk_elems, flat.numel())
+                    if start >= flat.numel():
+                        continue
+                    total = flat[start:end].float().sum().item()
+                    snippet = flat[start:min(start+8, end)].cpu().to(torch.float32)
+                    flexkv_logger.info(f"[CHECKSUM] {label} op={op_id} gpu layer0 idx={si}/{n} bid={bid} first8={snippet.tolist()} sum={total:.4f}")
+            else:
+                cpu_tensor = getattr(self, 'cpu_blocks', None)
+                if cpu_tensor is None:
+                    cpu_tensor = getattr(self, 'cpu_tensor', None)
+                if cpu_tensor is None:
+                    flexkv_logger.warning(f"[CHECKSUM] {label} no cpu_tensor")
+                    return
+                elem_size = self.dtype.itemsize
+                block_stride_elems = self.cpu_block_stride_in_bytes // elem_size
+                tp_stride_elems = self.cpu_tp_stride_in_bytes // elem_size
+                layer_stride_elems = self.cpu_layer_stride_in_bytes // elem_size
+                kv_stride_elems = self.cpu_kv_stride_in_bytes // elem_size
+                flat = cpu_tensor.flatten()
+                total_elems = flat.numel()
+                for layer_id in [0, self.num_layers - 1] if self.num_layers > 1 else [0]:
+                    for si in sample:
+                        bid = ids[si]
+                        base = layer_id * layer_stride_elems + 0 * kv_stride_elems + 0 * tp_stride_elems
+                        start = base + bid * block_stride_elems
+                        end = min(start + block_stride_elems, total_elems)
+                        if start >= total_elems:
+                            flexkv_logger.warning(f"[CHECKSUM] {label} OOB layer{layer_id} bid={bid} start={start} total={total_elems}")
+                            continue
+                        total = flat[start:end].float().sum().item()
+                        snippet = flat[start:min(start+8, end)].to(torch.float32)
+                        flexkv_logger.info(f"[CHECKSUM] {label} op={op_id} cpu layer{layer_id} idx={si}/{n} bid={bid} first8={snippet.tolist()} sum={total:.4f}")
+        except Exception as e:
+            flexkv_logger.warning(f"[CHECKSUM] {label} error: {e}")
+
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         # [PATCH 06-10] 拆分 D2H/H2D 时间为 3 段：queue_wait / kernel_launch / real_copy
         # 用法：在 worker process 启动时设 FLEXKV_DETAIL_TIMING=1 即开启细分日志
@@ -554,6 +607,14 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             t_queue_done = time.time()
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        # Safe pre-transfer checksum
+        if os.environ.get("FLEXKV_CHECKSUM_DEBUG", "0") == "1":
+            if transfer_op.transfer_type == TransferType.D2H:
+                torch.cuda.synchronize(self.gpu_blocks[0][0].device)
+                self._safe_checksum(src_block_ids, "D2H_PRE_GPU", transfer_op.transfer_op_id, True)
+            elif transfer_op.transfer_type == TransferType.H2D:
+                self._safe_checksum(src_block_ids, "H2D_PRE_CPU", transfer_op.transfer_op_id, False)
 
         start_time = time.time()
         self._transfer_impl(
@@ -595,6 +656,15 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
+
+        # Safe post-transfer checksum
+        if os.environ.get("FLEXKV_CHECKSUM_DEBUG", "0") == "1":
+            torch.cuda.synchronize(self.gpu_blocks[0][0].device)
+            if transfer_op.transfer_type == TransferType.D2H:
+                self._safe_checksum(dst_block_ids, "D2H_POST_CPU", transfer_op.transfer_op_id, False)
+            elif transfer_op.transfer_type == TransferType.H2D:
+                self._safe_checksum(dst_block_ids, "H2D_POST_GPU", transfer_op.transfer_op_id, True)
+
         return True
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):

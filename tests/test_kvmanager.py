@@ -37,7 +37,7 @@ def _fp8_cuda_ops_unavailable():
         t = torch.tensor([1.0], dtype=torch.float8_e4m3fn, device="cuda")
         t.mul(1.0)
         return False
-    except NotImplementedError:
+    except (NotImplementedError, RuntimeError):
         return True
 
 def run_tp_client(dp_client_id,
@@ -1107,6 +1107,544 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
         else:
             os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = orig_layerwise_env
         GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = orig_layerwise_flag
+
+
+# ============================================================
+# CE Transfer Mode Tests (copy engine D2H/H2D for P800)
+# ============================================================
+#
+# These tests exercise the three-path optimization in transfer.cc:
+#   Path 0: src+dst both contiguous → single cudaMemcpyAsync
+#   Path 1: few segments (≤ threshold) → per-segment cudaMemcpyAsync
+#   Path 2: many segments (> threshold) → CPU gather + H2D + GPU scatter
+#
+# Block layout patterns are used to control which path gets selected:
+#   "contiguous"  → arange(N)           → triggers Path 0 (1 segment)
+#   "few_gaps"    → 4 segments × 4 blocks → triggers Path 1 (4 segments)
+#   "many_gaps"   → 16 single-block segments → triggers Path 2 (16 segments)
+#
+# The CE (copy engine) mode is toggled via FLEXKV_USE_CE_TRANSFER_H2D /
+# FLEXKV_USE_CE_TRANSFER_D2H environment variables, which must be set
+# before KVManager construction because GLOBAL_CONFIG_FROM_ENV is read
+# at import time.
+
+def _generate_block_pattern(pattern_name: str, num_blocks: int, block_per_request: int):
+    """Generate (block_ids, token_ids) pairs with specific contiguity patterns.
+
+    Returns a list of (token_ids, block_ids) tuples, each with block_per_request blocks.
+    The patterns control how many segments transfer.cc will see:
+      - "contiguous": block_ids = arange(start, start+N) → 1 segment → Path 0
+      - "few_gaps":   4 segments of 4 blocks with gaps → Path 1 (≤ 8 segments)
+      - "many_gaps":  16 single-block segments with gaps → Path 2 (> 8 segments)
+
+    All patterns use the SAME token_ids per block so that get_match can find them.
+    """
+    pairs = []
+    tokens_per_block = 16  # default
+
+    if pattern_name == "contiguous":
+        # Sequential blocks: [0,1,2,...,N-1] → 1 segment → Path 0
+        for i in range(0, num_blocks, block_per_request):
+            block_ids = torch.arange(i, min(i + block_per_request, num_blocks), dtype=torch.int64)
+            token_ids = torch.randint(0, 10000, (len(block_ids) * tokens_per_block,), dtype=torch.int64)
+            pairs.append((token_ids, block_ids))
+
+    elif pattern_name == "few_gaps":
+        # 4 segments of 4 blocks with 8-block gaps → 4 segments → Path 1
+        # e.g. block_per_request=16 → [0,1,2,3, 12,13,14,15, 24,25,26,27, 36,37,38,39]
+        seg_size = block_per_request // 4
+        gap = seg_size * 2
+        for i in range(0, num_blocks, block_per_request * 3):
+            block_ids_list = []
+            for seg in range(4):
+                start = i + seg * (seg_size + gap)
+                if start + seg_size <= num_blocks:
+                    block_ids_list.extend(range(start, start + seg_size))
+            block_ids = torch.tensor(block_ids_list[:block_per_request], dtype=torch.int64)
+            token_ids = torch.randint(0, 10000, (len(block_ids) * tokens_per_block,), dtype=torch.int64)
+            if len(block_ids) >= block_per_request:
+                pairs.append((token_ids, block_ids))
+
+    elif pattern_name == "many_gaps":
+        # Every other block with gap → 16 segments of 1 block each → Path 2
+        # e.g. [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30] → 16 segments
+        # With threshold=8, this is > 8 → Path 2 (merged gather/scatter)
+        for i in range(0, num_blocks, block_per_request * 2):
+            block_ids_list = []
+            current = i
+            while len(block_ids_list) < block_per_request and current < num_blocks:
+                block_ids_list.append(current)
+                current += 2  # skip 1 block between each
+            block_ids = torch.tensor(block_ids_list[:block_per_request], dtype=torch.int64)
+            token_ids = torch.randint(0, 10000, (len(block_ids) * tokens_per_block,), dtype=torch.int64)
+            if len(block_ids) > 0:
+                pairs.append((token_ids, block_ids))
+
+    else:
+        raise ValueError(f"Unknown pattern: {pattern_name}")
+
+    return pairs
+
+
+def _setup_ce_env(ce_h2d: bool, ce_d2h: bool):
+    """Set CE transfer env vars and update GLOBAL_CONFIG_FROM_ENV in-place.
+
+    Must be called before KVManager construction. Returns (orig_h2d, orig_d2h)
+    for restoration.
+    """
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+
+    orig_h2d = GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d
+    orig_d2h = GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h
+    orig_env_h2d = os.environ.get('FLEXKV_USE_CE_TRANSFER_H2D')
+    orig_env_d2h = os.environ.get('FLEXKV_USE_CE_TRANSFER_D2H')
+
+    GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d = ce_h2d
+    GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h = ce_d2h
+    os.environ['FLEXKV_USE_CE_TRANSFER_H2D'] = '1' if ce_h2d else '0'
+    os.environ['FLEXKV_USE_CE_TRANSFER_D2H'] = '1' if ce_d2h else '0'
+
+    return (orig_h2d, orig_d2h, orig_env_h2d, orig_env_d2h)
+
+
+def _restore_ce_env(saved):
+    """Restore CE transfer env vars."""
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+
+    orig_h2d, orig_d2h, orig_env_h2d, orig_env_d2h = saved
+    GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d = orig_h2d
+    GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h = orig_d2h
+    for key, val in [('FLEXKV_USE_CE_TRANSFER_H2D', orig_env_h2d),
+                     ('FLEXKV_USE_CE_TRANSFER_D2H', orig_env_d2h)]:
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+
+def _run_ce_transfer_test(model_config, cache_config, num_gpu_blocks,
+                          block_pattern, ce_h2d, ce_d2h, layerwise,
+                          gpu_layout_type=0):
+    """Core test: D2H (put) → H2D (get) round-trip with specific CE + pattern.
+
+    Verifies that GPU KV cache values are preserved through the round-trip
+    for the given block contiguity pattern and CE transfer mode.
+    """
+    tokens_per_block = cache_config.tokens_per_block
+    block_per_request = 16
+
+    skip_if_insufficient_gpus(model_config.tp_size)
+
+    # Save and set CE env
+    ce_saved = _setup_ce_env(ce_h2d, ce_d2h)
+
+    # Save and set layerwise env
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+    orig_lw_flag = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
+    orig_lw_env = os.environ.get('FLEXKV_ENABLE_LAYERWISE_TRANSFER')
+    orig_sock_env = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET')
+    GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = layerwise
+    os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = '1' if layerwise else '0'
+
+    # For layerwise mode, need mock eventfd client
+    eventfd_thread = None
+    if layerwise:
+        # Use a unique socket path to avoid conflicts with production SGLang
+        import uuid
+        unique_sock = f'/tmp/flexkv_ce_test_eventfd_{uuid.uuid4().hex[:8]}.sock'
+        os.environ['FLEXKV_LAYERWISE_EVENTFD_SOCKET'] = unique_sock
+        # Also need to set FLEXKV_LAYERWISE_EVENTFD_CONNECT_MAX_RETRIES for slow init
+        os.environ.setdefault('FLEXKV_LAYERWISE_EVENTFD_CONNECT_MAX_RETRIES', '120')
+        eventfd_thread = threading.Thread(
+            target=_mock_sglang_eventfd_client,
+            args=(unique_sock, 0, model_config.tp_size, model_config.num_layers),
+            daemon=True,
+        )
+        eventfd_thread.start()
+
+    ce_label = f"ce_h2d={int(ce_h2d)},ce_d2h={int(ce_d2h)}"
+    lw_label = "lw" if layerwise else "nolw"
+    test_label = f"CE[{ce_label},{lw_label},{block_pattern}]"
+
+    # Disable MPS for test environments without nvidia-cuda-mps-control
+    orig_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
+    GLOBAL_CONFIG_FROM_ENV.enable_mps = False
+    os.environ['FLEXKV_ENABLE_MPS'] = '0'
+
+    try:
+        kvmanager = KVManager(
+            model_config=model_config,
+            cache_config=cache_config,
+            dp_client_id=0,
+        )
+        kvmanager.start()
+
+        # Spawn tp_client to register GPU blocks
+        mp_ctx = mp.get_context('spawn')
+        pipe_connections = []
+        tp_client_processes = []
+
+        for tp_rank in range(model_config.tp_size):
+            parent_conn, child_conn = mp_ctx.Pipe()
+            pipe_connections.append(parent_conn)
+
+            tp_client_process = mp_ctx.Process(
+                target=run_tp_client,
+                args=(0, tp_rank, kvmanager.gpu_register_port, model_config, cache_config,
+                      num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
+                daemon=True
+            )
+            tp_client_processes.append(tp_client_process)
+            tp_client_process.start()
+
+        # Collect GPU blocks
+        all_gpu_blocks = []
+        for tp_rank, parent_conn in enumerate(pipe_connections):
+            try:
+                shared_gpu_blocks = parent_conn.recv()
+                if shared_gpu_blocks is not None:
+                    all_gpu_blocks.append(shared_gpu_blocks)
+                parent_conn.close()
+            except Exception as e:
+                print(f"[Main] Error receiving from TP client {tp_rank}: {e}")
+
+        # Create verifier
+        gpu_kv_verifier = None
+        if all_gpu_blocks and len(all_gpu_blocks) == model_config.tp_size:
+            gpu_kv_layout = create_gpu_kv_layout(
+                model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+            gpu_kv_verifier = GPUKVCacheVerifier(
+                shared_gpu_blocks=all_gpu_blocks,
+                gpu_kv_layout=gpu_kv_layout,
+                tp_size=model_config.tp_size,
+                tokens_per_block=tokens_per_block,
+                dtype=model_config.dtype,
+                gpu_layout_type=gpu_layout_type,
+            )
+
+        while not kvmanager.is_ready():
+            time.sleep(1)
+            flexkv_logger.info(f"waiting for flexkv ({test_label}) to be ready")
+        print(f"[Test] KVManager ({test_label}) is ready")
+
+        # Generate block patterns
+        request_pairs = _generate_block_pattern(block_pattern, num_gpu_blocks, block_per_request)
+        assert len(request_pairs) > 0, f"No request pairs generated for pattern={block_pattern}"
+        num_requests = len(request_pairs)
+
+        # ---- Phase 1: PUT (D2H) all requests ----
+        print(f"[Test] PUT phase: {num_requests} requests ({test_label})...")
+        put_id2info = {}
+        for idx, (token_ids, block_ids) in enumerate(request_pairs):
+            if gpu_kv_verifier is not None:
+                gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+            slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+            put_request = kvmanager.put_async(
+                token_ids=token_ids,
+                slot_mapping=slot_mapping,
+                token_mask=None,
+            )
+            # Wait for each PUT individually (layerwise mode requires this)
+            kvmanager.wait([put_request], completely=True)
+            put_id2info[put_request] = (token_ids, block_ids, slot_mapping)
+
+            # Clear GPU blocks after D2H
+            if gpu_kv_verifier is not None:
+                gpu_kv_verifier.clear_gpu_blocks(block_ids)
+
+        print(f"[Test] PUT phase done ({num_requests} requests)")
+
+        # ---- Phase 2: GET (H2D) all requests ----
+        print(f"[Test] GET phase: {num_requests} requests ({test_label})...")
+
+        if layerwise:
+            # Batch all GETs as a single layerwise launch
+            batch_task_ids = []
+            batch_slot_mappings = []
+            req_id2info = {}
+
+            for idx, (token_ids, block_ids) in enumerate(request_pairs):
+                slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+                request_id, _ = kvmanager.get_match(
+                    token_ids=token_ids,
+                    token_mask=None,
+                )
+                batch_task_ids.append(request_id)
+                batch_slot_mappings.append(slot_mapping)
+                req_id2info[request_id] = (token_ids, block_ids, slot_mapping)
+
+            returned_ids = kvmanager.launch(
+                task_ids=batch_task_ids,
+                slot_mappings=batch_slot_mappings,
+                as_batch=True,
+                layerwise_transfer=True,
+            )
+            batch_id = returned_ids[0]
+            batch_results = kvmanager.wait(batch_id, completely=True)
+            kvresponse = batch_results[batch_id]
+            assert kvresponse.status == KVResponseStatus.SUCCESS, \
+                f"Layerwise batch GET failed: {kvresponse.status}"
+
+            # Verify each request
+            return_masks = kvresponse.return_mask
+            if not isinstance(return_masks, (list, tuple)):
+                # Single mask case - treat as one batch
+                return_masks = [return_masks]
+            for idx, orig_req_id in enumerate(batch_task_ids):
+                if idx >= len(return_masks):
+                    print(f"[WARN] return_mask has only {len(return_masks)} entries, expected {len(batch_task_ids)}")
+                    break
+                mask = return_masks[idx]
+                token_ids, block_ids, _ = req_id2info[orig_req_id]
+                valid_tokens = mask.sum().item() // tokens_per_block * tokens_per_block
+                if valid_tokens > 0 and gpu_kv_verifier is not None:
+                    assert gpu_kv_verifier.verify_kv_blocks(
+                        token_ids[:valid_tokens],
+                        block_ids[:valid_tokens // tokens_per_block])
+
+        else:
+            # Non-layerwise: launch each GET individually
+            running_get_requests = []
+            req_id2info = {}
+
+            for idx, (token_ids, block_ids) in enumerate(request_pairs):
+                slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+                request_id, _ = kvmanager.get_match(
+                    token_ids=token_ids,
+                    token_mask=None,
+                )
+                kvmanager.launch(request_id, slot_mapping)
+                running_get_requests.append(request_id)
+                req_id2info[request_id] = (token_ids, block_ids, slot_mapping)
+
+            # Wait for all gets
+            return_results = kvmanager.wait(running_get_requests, completely=True)
+
+            for req_id, kvresponse in return_results.items():
+                assert kvresponse.status == KVResponseStatus.SUCCESS, \
+                    f"GET failed for req_id={req_id}: {kvresponse.status}"
+                token_ids, block_ids, _ = req_id2info[req_id]
+                valid_tokens = kvresponse.return_mask.sum().item() // tokens_per_block * tokens_per_block
+                if valid_tokens > 0 and gpu_kv_verifier is not None:
+                    assert gpu_kv_verifier.verify_kv_blocks(
+                        token_ids[:valid_tokens],
+                        block_ids[:valid_tokens // tokens_per_block])
+
+        print(f"[Test] GET phase done ({test_label})")
+        print(f"[Test] {test_label} PASSED")
+
+        shutdown_tp_client(tp_client_processes)
+        kvmanager.shutdown()
+
+    finally:
+        # Restore env
+        _restore_ce_env(ce_saved)
+        GLOBAL_CONFIG_FROM_ENV.enable_mps = orig_mps
+        os.environ['FLEXKV_ENABLE_MPS'] = '1' if orig_mps else '0'
+        if orig_lw_env is None:
+            os.environ.pop('FLEXKV_ENABLE_LAYERWISE_TRANSFER', None)
+        else:
+            os.environ['FLEXKV_ENABLE_LAYERWISE_TRANSFER'] = orig_lw_env
+        GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = orig_lw_flag
+        # Restore socket env
+        if orig_sock_env is None:
+            os.environ.pop('FLEXKV_LAYERWISE_EVENTFD_SOCKET', None)
+        else:
+            os.environ['FLEXKV_LAYERWISE_EVENTFD_SOCKET'] = orig_sock_env
+
+        if eventfd_thread is not None:
+            eventfd_thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "use_mla": True},
+    ], indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 128, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("block_pattern", [
+    "contiguous",
+    "few_gaps",
+    "many_gaps",
+])
+@pytest.mark.parametrize("ce_mode", [
+    {"ce_h2d": True, "ce_d2h": True},
+    {"ce_h2d": False, "ce_d2h": False},
+    {"ce_h2d": True, "ce_d2h": False},
+    {"ce_h2d": False, "ce_d2h": True},
+])
+def test_kvmanager_ce_transfer(model_config, cache_config, test_config,
+                               block_pattern, ce_mode):
+    """Test D2H/H2D round-trip correctness under different CE modes and block patterns.
+
+    This test is designed to catch precision bugs in the copy-engine transfer
+    paths (transfer.cc Path 0/1/2) by varying:
+      - Block contiguity: contiguous (Path 0), few_gaps (Path 1), many_gaps (Path 2)
+      - CE mode: both on, both off, H2D-only, D2H-only
+
+    The test performs:
+      1. Fill GPU KV cache with deterministic hash values
+      2. PUT (D2H) to FlexKV CPU cache
+      3. Clear GPU KV cache
+      4. GET (H2D) to restore from FlexKV CPU cache
+      5. Verify GPU KV cache matches original values
+    """
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    _run_ce_transfer_test(
+        model_config=model_config,
+        cache_config=cache_config,
+        num_gpu_blocks=num_gpu_blocks,
+        block_pattern=block_pattern,
+        ce_h2d=ce_mode["ce_h2d"],
+        ce_d2h=ce_mode["ce_d2h"],
+        layerwise=False,
+        gpu_layout_type=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "use_mla": True},
+    ], indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 128, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("block_pattern", [
+    "contiguous",
+    "few_gaps",
+    "many_gaps",
+])
+def test_kvmanager_ce_transfer_layerwise(model_config, cache_config, test_config,
+                                         block_pattern):
+    """Test D2H/H2D round-trip with CE mode + layerwise transfer.
+
+    Layerwise mode fuses DISK2H + H2D into a single layer-by-layer pipeline.
+    This test uses CE mode (both H2D and D2H) with layerwise transfer enabled,
+    covering the exact configuration used in the P800 production environment:
+      FLEXKV_USE_CE_TRANSFER_H2D=1
+      FLEXKV_USE_CE_TRANSFER_D2H=1
+      FLEXKV_ENABLE_LAYERWISE_TRANSFER=1
+    """
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    _run_ce_transfer_test(
+        model_config=model_config,
+        cache_config=cache_config,
+        num_gpu_blocks=num_gpu_blocks,
+        block_pattern=block_pattern,
+        ce_h2d=True,
+        ce_d2h=True,
+        layerwise=True,
+        gpu_layout_type=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "use_mla": True},
+    ], indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 128, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("block_pattern", [
+    "contiguous",
+    "few_gaps",
+    "many_gaps",
+])
+@pytest.mark.parametrize("transfer_threshold", [1, 8, 1000])
+def test_kvmanager_ce_transfer_threshold(model_config, cache_config, test_config,
+                                         block_pattern, transfer_threshold):
+    """Test D2H/H2D correctness with varying XSGL_TRANSFER_SEGMENT_THRESHOLD.
+
+    This forces different path selections for the same block pattern:
+      - threshold=1:    Path 1 almost never used (most patterns → Path 2)
+      - threshold=8:    Default, balanced path selection
+      - threshold=1000: Path 2 almost never used (all patterns → Path 1)
+
+    CE mode is always ON (both H2D and D2H), non-layerwise.
+    """
+    orig_threshold = os.environ.get('XSGL_TRANSFER_SEGMENT_THRESHOLD')
+    os.environ['XSGL_TRANSFER_SEGMENT_THRESHOLD'] = str(transfer_threshold)
+
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    try:
+        _run_ce_transfer_test(
+            model_config=model_config,
+            cache_config=cache_config,
+            num_gpu_blocks=num_gpu_blocks,
+            block_pattern=block_pattern,
+            ce_h2d=True,
+            ce_d2h=True,
+            layerwise=False,
+            gpu_layout_type=0,
+        )
+    finally:
+        if orig_threshold is None:
+            os.environ.pop('XSGL_TRANSFER_SEGMENT_THRESHOLD', None)
+        else:
+            os.environ['XSGL_TRANSFER_SEGMENT_THRESHOLD'] = orig_threshold
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "use_mla": True},
+    ], indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {'enable_cpu': True, 'enable_ssd': False, 'num_cpu_blocks': 1024},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {'num_gpu_blocks': 128, 'requests_per_block': 16, 'initial_write_ratio': 0.4},
+], indirect=True)
+@pytest.mark.parametrize("block_pattern", [
+    "contiguous",
+    "few_gaps",
+    "many_gaps",
+])
+@pytest.mark.parametrize("merged_mode", [False, True])
+def test_kvmanager_ce_transfer_merged(model_config, cache_config, test_config,
+                                      block_pattern, merged_mode):
+    """Test D2H/H2D correctness with XSGL_TRANSFER_MERGED (Path 2 force) on/off.
+
+    When merged_mode=True, Path 1 is forced to Path 2 regardless of segment count.
+    This tests the CPU gather + H2D + GPU scatter path independently.
+    """
+    orig_merged = os.environ.get('XSGL_TRANSFER_MERGED')
+    os.environ['XSGL_TRANSFER_MERGED'] = '1' if merged_mode else '0'
+
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    try:
+        _run_ce_transfer_test(
+            model_config=model_config,
+            cache_config=cache_config,
+            num_gpu_blocks=num_gpu_blocks,
+            block_pattern=block_pattern,
+            ce_h2d=True,
+            ce_d2h=True,
+            layerwise=False,
+            gpu_layout_type=0,
+        )
+    finally:
+        if orig_merged is None:
+            os.environ.pop('XSGL_TRANSFER_MERGED', None)
+        else:
+            os.environ['XSGL_TRANSFER_MERGED'] = orig_merged
 
 
 
