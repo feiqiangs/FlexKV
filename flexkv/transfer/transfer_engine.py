@@ -755,9 +755,18 @@ class TransferEngine:
                         # Collect finished ops from main KV worker (batch get all available)
                         nvtx_r2 = nvtx.start_range(message="transfer scheduler. collect finished ops", color="orange")
                         # Get all available ops in one go to reduce system calls
+                        _prof_d2h = os.environ.get("FLEXKV_D2H_PROFILE", "0") == "1"
+                        _prof_t6_ns = time.monotonic_ns() if _prof_d2h else 0
                         while True:
                             try:
                                 op_id = self.finished_ops_queue.get_nowait()
+                                if _prof_d2h:
+                                    _t6_now = time.monotonic_ns()
+                                    flexkv_logger.info(
+                                        f"[D2H-PROF] T6 op_id={op_id} "
+                                        f"selector_wake_to_get={(_t6_now - _prof_t6_ns)/1e6:.3f}ms "
+                                        f"t6_total_from_loop_start={(_t6_now - _prof_t6_ns)/1e6:.3f}ms"
+                                    )
                                 if op_id in self._child_to_parent_op_id:
                                     parent_op_id = self._child_to_parent_op_id.pop(op_id)
                                     child_op = self._child_id_to_child.pop(op_id)

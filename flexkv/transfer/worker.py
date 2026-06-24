@@ -185,10 +185,14 @@ class TransferWorkerBase(ABC):
 
     def run(self) -> None:
         """main loop for worker process"""
+        prof_enabled = os.environ.get("FLEXKV_D2H_PROFILE", "0") == "1"
         while True:
             try:
                 if self.transfer_conn.poll(timeout=0.0001):  # check if data available
                     op = self.transfer_conn.recv()
+                    # [D2H-PROF] T2: worker-side pipe recv timestamp
+                    if prof_enabled:
+                        op.prof_t2_recv_ns = time.monotonic_ns()
                     if op is None:
                         # shut down zmq listening server of peer2cpuTransferWorker
                         if hasattr(self, "shutdown") and callable(self.shutdown):
@@ -209,13 +213,42 @@ class TransferWorkerBase(ABC):
                             nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
                                                 f"graph_id: {op.transfer_graph_id}",
                                                 color=get_nvtx_range_color(op.transfer_graph_id))
+                            # [D2H-PROF] T3: just before launch_transfer call
+                            if prof_enabled:
+                                op.prof_t3_launch_ns = time.monotonic_ns()
                             transfer_status = self.launch_transfer(op)
+                            # [D2H-PROF] T4: launch_transfer returned (kernel launched)
+                            if prof_enabled:
+                                t4_done_ns = time.monotonic_ns()
                             nvtx.pop_range()
                         except Exception as e:
                             flexkv_logger.error(f"Error launching transfer: {e}\n"
                                         f"Failed transfer op: {op}")
                         if transfer_status:
                             ## only put the op when transfer success
+                            # [D2H-PROF] T5: finished_ops_queue.put timestamp
+                            if prof_enabled:
+                                t5_put_ns = time.monotonic_ns()
+                                t1 = getattr(op, 'prof_t1_send_ns', 0)
+                                t2 = getattr(op, 'prof_t2_recv_ns', 0)
+                                t3 = getattr(op, 'prof_t3_launch_ns', 0)
+                                # IPC latency: scheduler send -> worker recv
+                                ipc_ms = (t2 - t1) / 1e6 if t1 and t2 else -1
+                                # Worker scheduling: recv -> launch
+                                sched_ms = (t3 - t2) / 1e6 if t2 and t3 else -1
+                                # Transfer impl: launch -> done
+                                xfer_ms = (t4_done_ns - t3) / 1e6 if t3 else -1
+                                # Queue put: done -> put
+                                put_ms = (t5_put_ns - t4_done_ns) / 1e6 if t4_done_ns else -1
+                                # End-to-end: send -> put
+                                e2e_ms = (t5_put_ns - t1) / 1e6 if t1 else -1
+                                flexkv_logger.info(
+                                    f"[D2H-PROF] op={op.transfer_op_id} type={op.transfer_type.name} "
+                                    f"blocks={getattr(op, 'valid_block_num', -1)} "
+                                    f"ipc={ipc_ms:.3f}ms sched={sched_ms:.3f}ms "
+                                    f"xfer={xfer_ms:.3f}ms put={put_ms:.3f}ms "
+                                    f"e2e={e2e_ms:.3f}ms"
+                                )
                             self.finished_ops_queue.put(op.transfer_op_id)
                 else:
                     continue
@@ -239,6 +272,9 @@ class WorkerHandle:
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
             worker_op = WorkerTransferOp(op)
+        # [D2H-PROF] T1: scheduler-side pipe send timestamp
+        if os.environ.get("FLEXKV_D2H_PROFILE", "0") == "1":
+            worker_op.prof_t1_send_ns = time.monotonic_ns()
         self.transfer_conn.send(worker_op)
 
     def shutdown(self) -> None:

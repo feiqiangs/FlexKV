@@ -563,7 +563,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
         detail_timing = os.environ.get("FLEXKV_LAYERWISE_DETAIL_TIMING", "0") == "1"
+        d2h_prof = os.environ.get("FLEXKV_D2H_PROFILE", "0") == "1"
         t0 = time.time()
+        # [D2H-PROF] T3 for layerwise path
+        t3_ns = time.monotonic_ns() if d2h_prof else 0
 
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
         dst_block_ids_h2d = torch.from_numpy(transfer_op.dst_block_ids_h2d).to(dtype=torch.int64).pin_memory()
@@ -664,5 +667,21 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             start_time,
             end_time,
         )
+
+        # [D2H-PROF] Log layerwise (H2D) profiling
+        if d2h_prof:
+            t4_ns = time.monotonic_ns()
+            t1 = getattr(transfer_op, 'prof_t1_send_ns', 0)
+            t2 = getattr(transfer_op, 'prof_t2_recv_ns', 0)
+            ipc_ms = (t2 - t1) / 1e6 if t1 and t2 else -1
+            sched_ms = (t3_ns - t2) / 1e6 if t2 and t3_ns else -1
+            xfer_ms = (t4_ns - t3_ns) / 1e6 if t3_ns else -1
+            e2e_ms = (t4_ns - t1) / 1e6 if t1 else -1
+            flexkv_logger.info(
+                f"[D2H-PROF] op={transfer_op.transfer_op_id} type=LAYERWISE(H2D) "
+                f"h2d_blocks={num_h2d_blocks} "
+                f"ipc={ipc_ms:.3f}ms sched={sched_ms:.3f}ms "
+                f"xfer={xfer_ms:.3f}ms e2e={e2e_ms:.3f}ms"
+            )
 
         return True

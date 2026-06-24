@@ -1,3 +1,5 @@
+import time
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,6 +29,11 @@ class WorkerTransferOp:
         self.valid_block_num = transfer_op.valid_block_num
         # Always preserve optional src_block_node_ids from TransferOp
         self.src_block_node_ids = transfer_op.src_block_node_ids
+
+        # [D2H-PROF] profiling timestamps (monotonic_ns, cross-process safe)
+        self.prof_t1_send_ns = 0  # set by WorkerHandle.submit_transfer
+        self.prof_t2_recv_ns = 0  # set by worker.run() after pipe recv
+        self.prof_t3_launch_ns = 0  # set before launch_transfer call
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
@@ -62,3 +69,8 @@ class WorkerLayerwiseTransferOp:
         self.counter_id = transfer_op.counter_id
         self.indexer_src_block_ids = transfer_op.indexer_src_block_ids
         self.indexer_dst_block_ids = transfer_op.indexer_dst_block_ids
+
+        # [D2H-PROF] profiling timestamps (monotonic_ns, cross-process safe)
+        self.prof_t1_send_ns = 0  # set by WorkerHandle.submit_transfer
+        self.prof_t2_recv_ns = 0  # set by worker.run() after pipe recv
+        self.prof_t3_launch_ns = 0  # set before launch_transfer call
