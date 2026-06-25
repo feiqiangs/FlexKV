@@ -30,7 +30,9 @@ namespace flexkv {
 static inline bool inner_timing_enabled() {
   static const int v = []() {
     const char *e = std::getenv("FLEXKV_INNER_TIMING");
-    return (e && e[0] == '1') ? 1 : 0;
+    // Default ON (set FLEXKV_INNER_TIMING=0 to disable)
+    if (e == nullptr) return 1;
+    return (e[0] == '1') ? 1 : 0;
   }();
   return v != 0;
 }

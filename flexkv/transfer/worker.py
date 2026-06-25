@@ -117,6 +117,19 @@ class TransferWorkerBase(ABC):
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
+        # Redirect worker subprocess stderr to a log file so C++ level profiling
+        # output (fprintf to stderr) from transfer.cu and tp_transfer_thread_group.cpp
+        # is captured instead of lost.
+        _worker_log_dir = os.environ.get("FLEXKV_WORKER_LOG_DIR", "/workspace/zittozhang/logs")
+        try:
+            os.makedirs(_worker_log_dir, exist_ok=True)
+            _worker_log_path = os.path.join(_worker_log_dir, f"flexkv_worker_{worker_id}.stderr")
+            _worker_log_fp = open(_worker_log_path, "w", buffering=1)  # line-buffered
+            sys.stderr = _worker_log_fp
+            os.dup2(_worker_log_fp.fileno(), 2)  # also redirect C-level fd 2
+        except Exception as e:
+            print(f"[Worker {worker_id}] Failed to redirect stderr: {e}", file=sys.__stderr__)
+
         # Enable faulthandler in worker subprocess to capture segfault/SIGBUS stack traces.
         faulthandler.enable(file=sys.stderr, all_threads=True)
         # Note: MPI initialization prevention is handled by create_safe_process

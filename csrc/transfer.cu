@@ -41,7 +41,9 @@ namespace {
 inline bool inner_path_timing_enabled() {
   static const int v = []() {
     const char *e = std::getenv("FLEXKV_PATH_TIMING");
-    return (e && e[0] == '1') ? 1 : 0;
+    // Default ON (set FLEXKV_PATH_TIMING=0 to disable)
+    if (e == nullptr) return 1;
+    return (e[0] == '1') ? 1 : 0;
   }();
   return v != 0;
 }
@@ -55,7 +57,9 @@ inline double now_ms_path() {
 inline bool dma_prof_enabled() {
   static const int v = []() {
     const char *e = std::getenv("FLEXKV_DMA_PROF");
-    return (e && e[0] == '1') ? 1 : 0;
+    // Default ON (set FLEXKV_DMA_PROF=0 to disable)
+    if (e == nullptr) return 1;
+    return (e[0] == '1') ? 1 : 0;
   }();
   return v != 0;
 }
