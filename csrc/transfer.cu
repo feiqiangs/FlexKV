@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <memory>
 #include <string>
+#include <atomic>
 #include <sys/mman.h>
 
 #include "monitoring/metrics_manager.h"
@@ -49,6 +50,16 @@ inline double now_ms_path() {
   return duration<double, std::milli>(
              steady_clock::now().time_since_epoch()).count();
 }
+
+// [DMA-PROF] Fine-grained DMA timing: segment_build / kernel_launch / stream_sync
+inline bool dma_prof_enabled() {
+  static const int v = []() {
+    const char *e = std::getenv("FLEXKV_DMA_PROF");
+    return (e && e[0] == '1') ? 1 : 0;
+  }();
+  return v != 0;
+}
+static std::atomic<uint64_t> g_dma_seq{0};
 }  // namespace
 
 
@@ -355,6 +366,14 @@ void transfer_kv_blocks(
     cudaStream_t stream, int transfer_num_cta, bool is_host_to_device,
     bool use_ce_transfer, bool is_mla, bool sync) {
 
+  // [DMA-PROF] Fine-grained timing: entry
+  const bool _dma_prof = dma_prof_enabled();
+  const uint64_t _dma_seq = _dma_prof ? g_dma_seq.fetch_add(1) : 0;
+  const double _dma_t_enter = _dma_prof ? now_ms_path() : 0.0;
+  // Lifted out for DMA-PROF reporting at function exit
+  int _dma_chosen_path = -1;
+  int64_t _dma_num_segments = 0;
+
   int block_size = 1024;
 
   int block_count = transfer_num_cta;
@@ -427,6 +446,9 @@ void transfer_kv_blocks(
       if (cpu_block_stride_in_bytes != chunk_size_in_bytes && chosen_path == 0) {
         chosen_path = 1;
       }
+      // Record for DMA-PROF
+      _dma_chosen_path = chosen_path;
+      _dma_num_segments = num_segments;
 
       // ----- Path 0: single big memcpy per (layer, kv_dim) -----
       // Only valid when blocks are physically contiguous in CPU memory
@@ -1049,8 +1071,29 @@ void transfer_kv_blocks(
         actual_chunk_bytes * static_cast<int64_t>(num_layers) *
             static_cast<int64_t>(kv_dim) * static_cast<int64_t>(num_blocks));
   }
+  // [DMA-PROF] Measure kernel launch vs stream sync
+  const double _dma_t_pre_sync = _dma_prof ? now_ms_path() : 0.0;
   if (sync) {
     cudaStreamSynchronize(stream);
+  }
+  if (_dma_prof) {
+    const double _dma_t_post_sync = now_ms_path();
+    const double _total = _dma_t_post_sync - _dma_t_enter;
+    const double _launch = _dma_t_pre_sync - _dma_t_enter;
+    const double _sync_wait = _dma_t_post_sync - _dma_t_pre_sync;
+    int _kv_dim = is_mla ? 1 : 2;
+    int64_t _total_bytes = chunk_size_in_bytes * num_layers * _kv_dim * num_blocks;
+    double _bw = _total_bytes / max(_sync_wait, 0.001) / 1e6; // MB/s
+    fprintf(stderr,
+        "[DMA-PROF] seq=%lu dir=%s path=%d layers=%d blocks=%d segs=%lld "
+        "bytes=%lldMB launch=%.1fms sync_wait=%.1fms total=%.1fms sync_bw=%.1fMB/s\n",
+        (unsigned long)_dma_seq,
+        is_host_to_device ? "H2D" : "D2H",
+        _dma_chosen_path,
+        num_layers, num_blocks, (long long)_dma_num_segments,
+        (long long)(_total_bytes / (1024*1024)),
+        _launch, _sync_wait, _total, _bw);
+    fflush(stderr);
   }
 }
 
