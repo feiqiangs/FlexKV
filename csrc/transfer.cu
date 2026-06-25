@@ -32,6 +32,7 @@
 
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
+#include "parallel_copy.h"  // [P1] parallel CPU gather/scatter + NT-store
 
 namespace flexkv {
 
@@ -791,62 +792,34 @@ void transfer_kv_blocks(
         bool need_pp_events = need_host_buf;
 
         // CPU scatter helper for D2H non-contig dst.
+        // [P1] parallelized across a CPU thread pool + non-temporal stores on
+        // the (write-once) KV-pool destination. block_stride may differ from
+        // chunk_size (sharded D2H); parallel_scatter_blocks addresses each
+        // block by block_ids[k]*block_stride_bytes so both cases are correct.
         auto cpu_scatter = [&](void *staging_base, int layer_idx, int kv_idx) {
           int64_t *cpu_layer_kv_base =
               cpu_ptr_int64 +
               (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
               kv_idx * cpu_kv_stride_int64 +
               cpu_startoff_inside_chunks_int64;
-          // When block_stride == chunk_size, blocks are physically contiguous
-          // and we can do per-segment bulk memcpy. When block_stride !=
-          // chunk_size (e.g. sharded D2H), each block must be copied
-          // individually to block_ids[k] * block_stride.
-          if (cpu_block_stride_in_bytes == chunk_size_in_bytes) {
-            int sb = 0;
-            while (sb < num_blocks) {
-              int se = sb + 1;
-              while (se < num_blocks &&
-                     cpu_block_ids[se] == cpu_block_ids[se - 1] + 1) {
-                ++se;
-              }
-              const int run = se - sb;
-              const char *src =
-                  static_cast<const char *>(staging_base) +
-                  static_cast<int64_t>(sb) * chunk_size_in_bytes;
-              int64_t *dst =
-                  cpu_layer_kv_base +
-                  cpu_block_ids[sb] * cpu_block_stride_int64;
-              std::memcpy(dst, src, static_cast<size_t>(run) * chunk_size_in_bytes);
-              sb = se;
-            }
-          } else {
-            for (int k = 0; k < num_blocks; ++k) {
-              const char *src =
-                  static_cast<const char *>(staging_base) +
-                  static_cast<int64_t>(k) * chunk_size_in_bytes;
-              int64_t *dst =
-                  cpu_layer_kv_base +
-                  cpu_block_ids[k] * cpu_block_stride_int64;
-              std::memcpy(dst, src, static_cast<size_t>(chunk_size_in_bytes));
-            }
-          }
+          parallel_scatter_blocks(
+              static_cast<void *>(cpu_layer_kv_base), cpu_block_ids,
+              cpu_block_stride_in_bytes, staging_base, chunk_size_in_bytes,
+              num_blocks);
         };
 
         // CPU gather helper for H2D non-contig src.
+        // [P1] parallelized + non-temporal stores on the (write-once) staging.
         auto cpu_gather = [&](void *staging_base, int layer_idx, int kv_idx) {
           int64_t *cpu_layer_kv_base =
               cpu_ptr_int64 +
               (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
               kv_idx * cpu_kv_stride_int64 +
               cpu_startoff_inside_chunks_int64;
-          for (int k = 0; k < num_blocks; ++k) {
-            const int64_t *src =
-                cpu_layer_kv_base +
-                cpu_block_ids[k] * cpu_block_stride_int64;
-            char *dst = static_cast<char *>(staging_base) +
-                        static_cast<int64_t>(k) * chunk_size_in_bytes;
-            std::memcpy(dst, src, static_cast<size_t>(chunk_size_in_bytes));
-          }
+          parallel_gather_blocks(
+              staging_base, static_cast<const void *>(cpu_layer_kv_base),
+              cpu_block_ids, cpu_block_stride_in_bytes, chunk_size_in_bytes,
+              num_blocks);
         };
 
         const int64_t total_iters =
