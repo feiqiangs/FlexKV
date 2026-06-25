@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cuda_runtime.h>
 #include <exception>
@@ -125,6 +126,28 @@ private:
   std::vector<int> layer_eventfds_;  // Flat array
   int current_counter_id_;  // Current counter set index for this transfer
 
+  // ===== Event-based layerwise notification (replaces cudaLaunchHostFunc) =====
+  // Per-batch CUDA events recorded on each GPU stream after submitting transfers.
+  // The polling thread queries these events with cudaEventQuery and writes
+  // eventfds as soon as a batch completes on ALL GPUs, enabling true layerwise
+  // overlap between CPU->GPU transfer and GPU compute.
+  struct PollBatchInfo {
+    int start_layer;
+    int layers_this_batch;
+    std::vector<cudaEvent_t> per_gpu_events;  // [num_gpus] one event per GPU per batch
+    bool notified = false;
+  };
+  std::vector<PollBatchInfo> poll_batches_;
+  std::atomic<bool> poll_stop_{false};
+  std::thread poll_thread_;
+  std::atomic<int> poll_next_batch_{0};  // Next batch index to check
+  std::mutex poll_mutex_;
+  std::condition_variable poll_cv_;
+  bool poll_active_ = false;
+
+  void event_polling_loop();
+  void notify_layer_batch(int start_layer, int layers_this_batch);
+
   struct IssueWorkerState {
     std::mutex mutex;
     std::condition_variable cv;
@@ -145,12 +168,6 @@ private:
   void stop_issue_workers();
   void submit_issue_job(int gpu_idx, std::function<void()> job);
   void wait_issue_job(int gpu_idx);
-
-  void layer_done_callback(int start_layer, int layers_this_batch,
-                           nvtxRangeId_t *current_range_id_ptr,
-                           bool is_last_batch,
-                           const char *next_range_name,
-                           nvtxRangeId_t *next_range_id_ptr);
 };
 
 } // namespace flexkv

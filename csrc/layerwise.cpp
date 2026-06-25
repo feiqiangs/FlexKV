@@ -1,5 +1,6 @@
 #include "layerwise.h"
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -10,53 +11,88 @@
 
 namespace flexkv {
 
-struct LayerCallbackData {
-  int start_layer;
-  int layers_this_batch;
-  int num_gpus;
-  std::atomic<int> *counter;
-  // Eventfd info for notification
-  bool enable_eventfd;
-  int tp_size;
-  int num_layers;
-  int *layer_eventfds;  // Pointer to eventfds array for current counter set
-  // NVTX range id for CPU->GPU transfer
-  nvtxRangeId_t *current_range_id_ptr;  // Pointer to current layer's range ID
-  bool is_last_batch;  // Whether this is the last batch
-  char next_range_name[64];  // Name for next layer's range (if not last batch)
-  nvtxRangeId_t *next_range_id_ptr;  // Pointer to next layer's range ID storage
-};
+// ===== Event-based layerwise notification =====
+// Replaces cudaLaunchHostFunc (which does not work on Hygon DCU).
+// The polling thread queries per-batch CUDA events and writes eventfds
+// as soon as each batch completes on all GPUs.
 
-static void CUDART_CB layer_done_host_callback(void *userData) {
-  LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
-  int completed = data->counter->fetch_add(1) + 1;
-  if (completed == data->num_gpus) {
-    // Notify via eventfd when all GPUs complete this layer batch
-    if (data->enable_eventfd && data->layer_eventfds != nullptr) {
-      // Signal each tp_rank's eventfd for completed layers
-      for (int layer = data->start_layer; 
-           layer < data->start_layer + data->layers_this_batch; ++layer) {
-        for (int tp_rank = 0; tp_rank < data->tp_size; ++tp_rank) {
-          int fd = data->layer_eventfds[tp_rank * data->num_layers + layer];
-          if (fd >= 0) {
-            // Write 2 to support both get_key_buffer and get_value_buffer waits
-            uint64_t val = 2;
-            ssize_t ret = write(fd, &val, sizeof(val));
-          }
-        }
+void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
+                                                 int layers_this_batch) {
+  if (!enable_eventfd_ || layer_eventfds_.empty()) return;
+
+  int offset = current_counter_id_ * tp_size_ * num_layers_;
+  int *eventfds_base = layer_eventfds_.data() + offset;
+
+  for (int layer = start_layer;
+       layer < start_layer + layers_this_batch; ++layer) {
+    for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
+      int fd = eventfds_base[tp_rank * num_layers_ + layer];
+      if (fd >= 0) {
+        uint64_t val = 2;  // Support both get_key_buffer and get_value_buffer waits
+        ssize_t ret = write(fd, &val, sizeof(val));
+        (void)ret;
       }
     }
-    // End current NVTX range when all GPUs complete
-    if (data->current_range_id_ptr != nullptr && *data->current_range_id_ptr != 0) {
-      nvtxRangeEnd(*data->current_range_id_ptr);
-    }
-    // Start next layer's NVTX range (so it begins right after current layer ends)
-    if (!data->is_last_batch && data->next_range_id_ptr != nullptr) {
-      *data->next_range_id_ptr = nvtxRangeStartA(data->next_range_name);
-    }
-    delete data->counter;
   }
-  delete data;
+  fprintf(stderr, "[LW-EVT] notified layers [%d, %d) counter_id=%d\n",
+          start_layer, start_layer + layers_this_batch, current_counter_id_);
+}
+
+void LayerwiseTransferGroup::event_polling_loop() {
+  fprintf(stderr, "[LW-EVT] polling thread started, num_batches=%zu\n",
+          poll_batches_.size());
+
+  while (!poll_stop_.load(std::memory_order_acquire)) {
+    int next = poll_next_batch_.load(std::memory_order_acquire);
+    if (next >= (int)poll_batches_.size()) {
+      // All batches notified, exit
+      break;
+    }
+
+    PollBatchInfo &batch = poll_batches_[next];
+    if (batch.notified) {
+      poll_next_batch_.fetch_add(1, std::memory_order_acq_rel);
+      continue;
+    }
+
+    // Check if all GPUs have completed this batch
+    bool all_done = true;
+    for (int g = 0; g < num_gpus_ && all_done; ++g) {
+      cudaSetDevice(gpu_device_ids_[g]);
+      cudaError_t err = cudaEventQuery(batch.per_gpu_events[g]);
+      if (err == cudaErrorNotReady) {
+        all_done = false;
+      } else if (err != cudaSuccess) {
+        fprintf(stderr, "[LW-EVT] cudaEventQuery error GPU=%d batch=%d: %s\n",
+                g, next, cudaGetErrorString(err));
+        all_done = false;
+      }
+    }
+
+    if (all_done) {
+      batch.notified = true;
+      notify_layer_batch(batch.start_layer, batch.layers_this_batch);
+      poll_next_batch_.fetch_add(1, std::memory_order_acq_rel);
+    } else {
+      // Brief yield to avoid burning CPU
+      std::this_thread::yield();
+    }
+  }
+
+  // Safety: if we exit early but some batches weren't notified, notify them now
+  for (auto &batch : poll_batches_) {
+    if (!batch.notified) {
+      // Force-check with cudaEventSynchronize (blocking) as fallback
+      for (int g = 0; g < num_gpus_; ++g) {
+        cudaSetDevice(gpu_device_ids_[g]);
+        cudaEventSynchronize(batch.per_gpu_events[g]);
+      }
+      batch.notified = true;
+      notify_layer_batch(batch.start_layer, batch.layers_this_batch);
+    }
+  }
+
+  fprintf(stderr, "[LW-EVT] polling thread exiting, all batches notified\n");
 }
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
@@ -251,6 +287,19 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
+  // Stop polling thread first
+  poll_stop_.store(true, std::memory_order_release);
+  if (poll_thread_.joinable()) {
+    poll_thread_.join();
+  }
+  // Clean up poll batch events
+  for (auto &pb : poll_batches_) {
+    for (auto &ev : pb.per_gpu_events) {
+      cudaEventDestroy(ev);
+    }
+  }
+  poll_batches_.clear();
+
   stop_issue_workers();
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
@@ -360,35 +409,6 @@ void LayerwiseTransferGroup::wait_issue_job(int gpu_idx) {
   }
 }
 
-void LayerwiseTransferGroup::layer_done_callback(int start_layer,
-                                                 int layers_this_batch,
-                                                 nvtxRangeId_t *current_range_id_ptr,
-                                                 bool is_last_batch,
-                                                 const char *next_range_name,
-                                                 nvtxRangeId_t *next_range_id_ptr) {
-  std::atomic<int> *counter = new std::atomic<int>(0);
-  
-  // Get eventfd pointer for current counter set
-  int *eventfds_ptr = nullptr;
-  if (enable_eventfd_ && num_counters_ > 0) {
-    // Offset into layer_eventfds_ for current counter set
-    int offset = current_counter_id_ * tp_size_ * num_layers_;
-    eventfds_ptr = layer_eventfds_.data() + offset;
-  }
-  
-  for (int i = 0; i < num_gpus_; ++i) {
-    LayerCallbackData *data = new LayerCallbackData{
-        start_layer, layers_this_batch, num_gpus_, counter,
-        enable_eventfd_, tp_size_, num_layers_, eventfds_ptr,
-        current_range_id_ptr, is_last_batch, {0}, next_range_id_ptr};
-    // Copy next range name
-    if (next_range_name != nullptr) {
-      snprintf(data->next_range_name, sizeof(data->next_range_name), "%s", next_range_name);
-    }
-    cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
-  }
-}
-
 void LayerwiseTransferGroup::layerwise_transfer(
     const torch::Tensor &ssd_block_ids, const torch::Tensor &cpu_block_ids_d2h,
     const int64_t ssd_layer_stride_in_bytes,
@@ -447,59 +467,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
   // Create CUDA events for timing each layer batch (on GPU 0)
   int num_batches = (num_layers + layer_granularity - 1) / layer_granularity;
-  std::vector<cudaEvent_t> timing_events(num_batches + 1);  // +1 for start event
   std::vector<int> batch_start_layers(num_batches);
   std::vector<int> batch_layers_count(num_batches);
-  
-  cudaSetDevice(gpu_device_ids_[0]);
-  for (int i = 0; i <= num_batches; ++i) {
-    cudaEventCreate(&timing_events[i]);
-  }
-  
-  // Record start event
-  cudaEventRecord(timing_events[0], streams_[0]);
-
-  // Allocate storage for NVTX range IDs (one per batch)
-  std::vector<nvtxRangeId_t> h2d_range_ids(num_batches, 0);
-  // Pre-generate all range names with data size info
-  std::vector<std::string> h2d_range_names(num_batches);
-  for (int b = 0; b < num_batches; ++b) {
-    int sl = b * layer_granularity;
-    int ltb = std::min(layer_granularity, num_layers - sl);
-    // Calculate data size for this batch: chunk_size * 2 (K+V) * layers * num_blocks
-    int64_t bytes_this_batch = 0;
-    for (int g = 0; g < num_gpus_; ++g) {
-      bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * ltb * num_blocks;
-    }
-    // Add indexer bytes if applicable
-    int64_t indexer_bytes_this_batch = 0;
-    if (do_indexer_transfer) {
-      for (int g = 0; g < num_gpus_; ++g) {
-        indexer_bytes_this_batch += indexer_gpu_chunk_sizes_in_bytes_[g] * ltb * num_indexer_blocks;
-      }
-    }
-    double mb_this_batch = (bytes_this_batch + indexer_bytes_this_batch) / (1024.0 * 1024.0);
-    char name[256];
-    if (do_indexer_transfer) {
-      snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) KV:%.2fMB+Idx:%.2fMB",
-               sl, sl + ltb, bytes_this_batch / (1024.0 * 1024.0),
-               indexer_bytes_this_batch / (1024.0 * 1024.0));
-    } else {
-      snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) %.2fMB", sl, sl + ltb,
-               bytes_this_batch / (1024.0 * 1024.0));
-    }
-    h2d_range_names[b] = name;
-  }
-
-  // Start the first batch's NVTX range in main thread
-  if (num_batches > 0) {
-    h2d_range_ids[0] = nvtxRangeStartA(h2d_range_names[0].c_str());
-  }
 
   // Step 0: SSD -> CPU transfer for ALL layers at once (before layerwise loop).
-  // This is required because the CPU memory uses TP-divided layout where each rank's
-  // data occupies a contiguous region [rank*tp_stride, (rank+1)*tp_stride). Per-layer-batch
-  // SSD reads with full strides would land at wrong CPU positions for TP > 1.
   if (enable_ssd_ && ssd_block_ids.numel() > 0) {
     int num_ssd_blocks = ssd_block_ids.numel();
     int64_t ssd_bytes = cpu_chunk_size_in_bytes * 2 * num_layers * num_ssd_blocks;
@@ -555,6 +526,47 @@ void LayerwiseTransferGroup::layerwise_transfer(
     nvtxRangePop();
   }
 
+  // ===== Event-based layerwise notification =====
+  // Prepare per-batch polling structures. For each batch, we create one
+  // cudaEvent per GPU. After submitting all GPU transfers for a batch, we
+  // record an event on each GPU stream. The polling thread queries these
+  // events and writes eventfds as soon as a batch completes on all GPUs.
+
+  // If a previous poll thread is still running, join it first to ensure
+  // all GPU work from the previous transfer is complete.
+  if (poll_active_) {
+    poll_stop_.store(true, std::memory_order_release);
+    poll_cv_.notify_all();
+    if (poll_thread_.joinable()) {
+      poll_thread_.join();
+    }
+    poll_active_ = false;
+  }
+
+  // Clean up previous poll batches' events
+  for (auto &pb : poll_batches_) {
+    for (auto &ev : pb.per_gpu_events) {
+      cudaEventDestroy(ev);
+    }
+  }
+  poll_batches_.clear();
+  poll_batches_.resize(num_batches);
+  for (int b = 0; b < num_batches; ++b) {
+    int sl = b * layer_granularity;
+    int ltb = std::min(layer_granularity, num_layers - sl);
+    poll_batches_[b].start_layer = sl;
+    poll_batches_[b].layers_this_batch = ltb;
+    poll_batches_[b].per_gpu_events.resize(num_gpus_);
+    poll_batches_[b].notified = false;
+    for (int g = 0; g < num_gpus_; ++g) {
+      cudaSetDevice(gpu_device_ids_[g]);
+      cudaEventCreateWithFlags(&poll_batches_[b].per_gpu_events[g],
+                                cudaEventDisableTiming);
+    }
+  }
+  poll_stop_.store(false, std::memory_order_release);
+  poll_next_batch_.store(0, std::memory_order_release);
+
   int batch_idx = 0;
   for (int start_layer = 0; start_layer < num_layers;
        start_layer += layer_granularity) {
@@ -564,9 +576,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     batch_start_layers[batch_idx] = start_layer;
     batch_layers_count[batch_idx] = layers_this_batch;
 
-    // Step 1: CPU -> GPU transfer
-    // NVTX range for this batch was already started (by main thread for first batch,
-    // or by previous batch's callback for subsequent batches)
+    // Step 1: CPU -> GPU transfer for this layer batch
     auto issue_one_gpu = [&](int i) {
       cudaSetDevice(gpu_device_ids_[i]);
       int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
@@ -604,14 +614,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
       }
 
       // Fused indexer CPU -> GPU transfer on the same stream
-      // Uses transfer_kv_blocks (symmetric with main KV Step 2) instead of
-      // hand-written cudaMemcpyAsync loops for backend-agnostic support.
-      // Note: indexer uses ReplicatedLinear weights with 1 head (is_mla=true),
-      // so all TP ranks hold identical data. No TP head-partitioning needed,
-      // cpu_startoff is always 0 (unlike main KV which may offset by tp_stride).
       if (do_indexer_transfer) {
         int64_t idx_chunk_size = indexer_gpu_chunk_sizes_in_bytes_[i];
-        // idx_cpu_startoff = 0: indexer data is not partitioned across TP ranks
         int64_t idx_cpu_startoff = 0;
 
         switch (indexer_backend_type_) {
@@ -619,40 +623,34 @@ void LayerwiseTransferGroup::layerwise_transfer(
           flexkv::transfer_kv_blocks<BackendType::VLLM>(
               num_indexer_blocks, start_layer, layers_this_batch,
               indexer_gpu_block_ids, indexer_gpu_tensor_handlers_[i],
-              0 /* gpu_startoff */, indexer_cpu_block_ids,
-              indexer_cpu_blocks_,
+              0, indexer_cpu_block_ids, indexer_cpu_blocks_,
               indexer_h2d_cpu_kv_stride_in_bytes,
               indexer_h2d_cpu_layer_stride_in_bytes,
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
-              streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              streams_[i], transfer_cta_num, true, use_ce_transfer, true, false);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
               num_indexer_blocks, start_layer, layers_this_batch,
               indexer_gpu_block_ids, indexer_gpu_tensor_handlers_[i],
-              0 /* gpu_startoff */, indexer_cpu_block_ids,
-              indexer_cpu_blocks_,
+              0, indexer_cpu_block_ids, indexer_cpu_blocks_,
               indexer_h2d_cpu_kv_stride_in_bytes,
               indexer_h2d_cpu_layer_stride_in_bytes,
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
-              streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              streams_[i], transfer_cta_num, true, use_ce_transfer, true, false);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
               num_indexer_blocks, start_layer, layers_this_batch,
               indexer_gpu_block_ids, indexer_gpu_tensor_handlers_[i],
-              0 /* gpu_startoff */, indexer_cpu_block_ids,
-              indexer_cpu_blocks_,
+              0, indexer_cpu_block_ids, indexer_cpu_blocks_,
               indexer_h2d_cpu_kv_stride_in_bytes,
               indexer_h2d_cpu_layer_stride_in_bytes,
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
-              streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              streams_[i], transfer_cta_num, true, use_ce_transfer, true, false);
           break;
         }
       }
@@ -671,77 +669,25 @@ void LayerwiseTransferGroup::layerwise_transfer(
       }
     }
 
-    // Record event after this batch on GPU 0
-    cudaSetDevice(gpu_device_ids_[0]);
-    cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
+    // Record a CUDA event on each GPU stream after this batch's transfers.
+    // The polling thread will query these events to detect batch completion
+    // and write eventfds for true layerwise notification.
+    for (int g = 0; g < num_gpus_; ++g) {
+      cudaSetDevice(gpu_device_ids_[g]);
+      cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[g], streams_[g]);
+    }
 
-    // NVTX: current range ends in callback, next range starts in callback
-    bool is_last_batch = (batch_idx == num_batches - 1);
-    const char *next_name = is_last_batch ? nullptr : h2d_range_names[batch_idx + 1].c_str();
-    nvtxRangeId_t *next_id_ptr = is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
-    
-    layer_done_callback(start_layer, layers_this_batch,
-                        &h2d_range_ids[batch_idx], is_last_batch,
-                        next_name, next_id_ptr);
     batch_idx++;
   }
-  for (int i = 0; i < num_gpus_; ++i) {
-    cudaError_t err = cudaStreamSynchronize(streams_[i]);
-    if (err != cudaSuccess) {
-      throw std::runtime_error("layerwise_transfer failed on GPU " +
-                               std::to_string(i) + ": " +
-                               cudaGetErrorString(err));
-    }
-  }
 
-  // Calculate and print timing for each layer batch
-  // chunk_size per GPU * num_gpus * 2 (K+V) * layers_this_batch * num_blocks
-  // fprintf(stderr, "\n[LayerwiseTransfer] CPU->GPU Transfer Timing (num_blocks=%d):\n", num_blocks);
-  float total_time_ms = 0.0f;
-  int64_t total_bytes = 0;
-  
-  for (int i = 0; i < num_batches; ++i) {
-    float elapsed_ms = 0.0f;
-    cudaEventElapsedTime(&elapsed_ms, timing_events[i], timing_events[i + 1]);
+  // Start the polling thread. It will query events and write eventfds
+  // as each batch completes, enabling overlap with scheduler compute.
+  // The main thread returns immediately (no cudaStreamSynchronize).
+  poll_active_ = true;
+  poll_thread_ = std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
 
-    // Calculate bytes transferred for this batch
-    // For each GPU: chunk_size * 2 (K+V) * layers * num_blocks
-    int64_t bytes_this_batch = 0;
-    for (int g = 0; g < num_gpus_; ++g) {
-      bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * batch_layers_count[i] * num_blocks;
-    }
-    // Include indexer bytes
-    int64_t indexer_bytes_batch = 0;
-    if (do_indexer_transfer) {
-      for (int g = 0; g < num_gpus_; ++g) {
-        indexer_bytes_batch += indexer_gpu_chunk_sizes_in_bytes_[g] * batch_layers_count[i] * num_indexer_blocks;
-      }
-      bytes_this_batch += indexer_bytes_batch;
-    }
-    
-    double bandwidth_gbps = (bytes_this_batch / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
-    
-    // fprintf(stderr, "  Layers [%d, %d): time=%.3f ms, size=%.2f MB, bandwidth=%.2f GB/s\n",
-    //         batch_start_layers[i], 
-    //         batch_start_layers[i] + batch_layers_count[i],
-    //         elapsed_ms,
-    //         bytes_this_batch / (1024.0 * 1024.0),
-    //         bandwidth_gbps);
-    
-    total_time_ms += elapsed_ms;
-    total_bytes += bytes_this_batch;
-  }
-  
-  double total_bandwidth_gbps = (total_bytes / (1024.0 * 1024.0 * 1024.0)) / (total_time_ms / 1000.0);
-  // fprintf(stderr, "  Total: time=%.3f ms, size=%.2f MB, avg_bandwidth=%.2f GB/s\n\n",
-  //         total_time_ms, total_bytes / (1024.0 * 1024.0), total_bandwidth_gbps);
-  // fflush(stderr);
-
-  // Cleanup timing events
-  cudaSetDevice(gpu_device_ids_[0]);
-  for (int i = 0; i <= num_batches; ++i) {
-    cudaEventDestroy(timing_events[i]);
-  }
+  fprintf(stderr, "[LW-EVT] submitted %d batches, polling thread launched, "
+          "main thread returning (no sync)\n", num_batches);
 }
 
 } // namespace flexkv
