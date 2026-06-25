@@ -179,6 +179,17 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.h2d_cta_num = h2d_cta_num
         self.d2h_cta_num = d2h_cta_num
 
+        # [P3] Layer granularity for the layerwise CPU->GPU transfer.
+        # With granularity > 1, transfer_kv_blocks is invoked with num_layers > 1,
+        # which enables its built-in ping-pong staging so the CPU gather of layer
+        # batch (L+1) overlaps with the H2D DMA of batch L. This coarsens the
+        # per-layer eventfd granularity (one notification per batch instead of
+        # per layer), which is fine for transfer-bound long-context loads where
+        # there is little prefill compute to overlap with anyway.
+        self.layer_granularity = max(
+            1, int(os.getenv("FLEXKV_LAYERWISE_GRANULARITY", "1"))
+        )
+
         # initialize SSD storage
         self.enable_ssd = len(ssd_files) > 0
         self.ssd_files = ssd_files
@@ -544,7 +555,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.h2d_cta_num,
             self.use_ce_transfer_h2d,
             self.num_layers,
-            1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
+            self.layer_granularity,  # [P3] env FLEXKV_LAYERWISE_GRANULARITY (>1 enables gather<->H2D overlap)
             self.is_mla,
             counter_id,
             indexer_gpu_block_id_tensor,

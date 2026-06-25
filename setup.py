@@ -70,6 +70,7 @@ enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/transfer.cu",  # Skip CUDA file for now
+    "csrc/parallel_copy.cpp",  # [P1] parallel CPU gather/scatter + NT-store
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
     "csrc/transfer_ssd.cpp",
@@ -80,6 +81,7 @@ cpp_sources = [
 
 hpp_sources = [
     "csrc/cache_utils.h",
+    "csrc/parallel_copy.h",  # [P1] parallel CPU gather/scatter + NT-store
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
