@@ -200,11 +200,34 @@ struct HugepageBufferHolder {
   }
 };
 
+// [BUGFIX] Forward declaration: before we free/realloc a device's staging
+// buffer we must wait for any in-flight transfer still reading it. Defined
+// after get_cached_pingpong_events() since it needs that event pair.
+static void sync_and_reset_staging_pingpong();
+
+// Per-(thread, device) hugepage staging buffer. Making it per-device is
+// required because under the default (non-persistent) layerwise issue path a
+// single CPU thread issues transfers for *all* GPUs; a single shared staging
+// buffer would let GPU i's gather overwrite the buffer while GPU (i-1)'s async
+// H2D is still reading it.
 static void *get_cached_hugepage_buffer(size_t needed_size) {
-  static thread_local HugepageBufferHolder holder;
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (dev < 0) dev = 0;
+  static thread_local std::vector<std::unique_ptr<HugepageBufferHolder>> holders;
+  if (static_cast<size_t>(dev) >= holders.size()) {
+    holders.resize(static_cast<size_t>(dev) + 1);
+  }
+  if (!holders[dev]) {
+    holders[dev] = std::make_unique<HugepageBufferHolder>();
+  }
+  HugepageBufferHolder &holder = *holders[dev];
   if (holder.ptr != nullptr && holder.size >= needed_size) {
     return holder.ptr;
   }
+  // Reallocating: an older (smaller) buffer may still be read by an in-flight
+  // H2D from a previous call. Drain it before munmap to avoid use-after-free.
+  sync_and_reset_staging_pingpong();
   const size_t new_size = std::max(needed_size, get_hugepage_default_min_bytes());
   if (holder.ptr != nullptr) {
     free_hugepage_memory(holder.ptr, holder.size);
@@ -255,6 +278,42 @@ static cudaEvent_t *get_cached_pingpong_events() {
   }
   holders[current_device]->ensure_init(current_device);
   return holders[current_device]->events;
+}
+
+// [BUGFIX] Per-(thread, device) ping-pong slot state for the host staging
+// buffer, persisted ACROSS transfer_kv_blocks() calls. The previous code used
+// a function-local `pp_used[2]` that reset every call, so in layerwise mode
+// (one call per layer-batch, sync=false) a new call would overwrite host_buf
+// while the previous layer's async H2D was still reading it -> data
+// corruption. Persisting the state lets us (a) wait on a slot's prior H2D
+// before overwriting it and (b) alternate slots across calls so gather(L+1)
+// overlaps H2D(L) even when each call carries a single layer.
+struct StagingPingPongState {
+  bool inflight[2] = {false, false};  // slot has an unsynced H2D reading host_buf
+  unsigned next = 0;                  // running counter -> slot = next & 1
+};
+
+static StagingPingPongState &get_staging_pingpong_state() {
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (dev < 0) dev = 0;
+  static thread_local std::vector<StagingPingPongState> states;
+  if (static_cast<size_t>(dev) >= states.size()) {
+    states.resize(static_cast<size_t>(dev) + 1);
+  }
+  return states[dev];
+}
+
+static void sync_and_reset_staging_pingpong() {
+  StagingPingPongState &st = get_staging_pingpong_state();
+  if (st.inflight[0] || st.inflight[1]) {
+    cudaEvent_t *ev = get_cached_pingpong_events();
+    if (st.inflight[0]) cudaEventSynchronize(ev[0]);
+    if (st.inflight[1]) cudaEventSynchronize(ev[1]);
+  }
+  st.inflight[0] = false;
+  st.inflight[1] = false;
+  st.next = 0;
 }
 
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
@@ -822,6 +881,15 @@ void transfer_kv_blocks(
               num_blocks);
         };
 
+        // [BUGFIX] D2H overwrites host_buf via device->host copies, so any
+        // in-flight H2D from a previous call that still reads this device's
+        // host_buf must finish first. The H2D path below drives the persistent
+        // ping-pong state; D2H keeps its own in-call drain (see end of loop),
+        // so here we just drain+reset before reusing the buffer.
+        if (!is_host_to_device && need_host_buf) {
+          sync_and_reset_staging_pingpong();
+        }
+
         const int64_t total_iters =
             static_cast<int64_t>(num_layers) * static_cast<int64_t>(kv_dim);
         for (int64_t it = 0; it < total_iters; ++it) {
@@ -888,8 +956,16 @@ void transfer_kv_blocks(
             }
           } else {
             // ============= H2D ===========================================
-            // Step A (CPU gather, when !src_contig): memcpy into host_buf[idx].
+            // Step A (CPU gather, when !src_contig): gather into host_buf.
+            // [BUGFIX] Use the persistent per-device ping-pong state so the
+            // staging slot is (a) drained before overwrite and (b) alternated
+            // across calls. host_buf reuse is the only cross-call hazard; the
+            // GPU scatter buffer dev_buf is freshly allocated per call and is
+            // stream-ordered by the caching allocator, so it keeps using the
+            // in-call index `idx`.
+            StagingPingPongState &pp = get_staging_pingpong_state();
             const void *h2d_src_ptr;
+            int hslot = -1;  // host staging slot used this iteration (-1 = none)
             if (src_contig) {
               // Direct contiguous source slice in cpu_ptr.
               h2d_src_ptr =
@@ -899,13 +975,17 @@ void transfer_kv_blocks(
                   cpu_block_ids[0] * cpu_block_stride_int64 +
                   cpu_startoff_inside_chunks_int64;
             } else {
-              if (need_pp_events && pp_used[idx]) {
-                // Make sure previous use of host_buf[idx] (the H2D that
-                // consumed it) has completed before we overwrite it.
-                cudaEventSynchronize(pp_events[idx]);
+              hslot = static_cast<int>(pp.next & 1);
+              pp.next++;
+              if (need_pp_events && pp.inflight[hslot]) {
+                // The previous H2D that read this slot must finish before we
+                // overwrite host_buf[hslot]. This is the fix for the layerwise
+                // (sync=false) cross-call staging corruption.
+                cudaEventSynchronize(pp_events[hslot]);
+                pp.inflight[hslot] = false;
               }
-              cpu_gather(host_buf[idx], i, j);
-              h2d_src_ptr = host_buf[idx];
+              cpu_gather(host_buf[hslot], i, j);
+              h2d_src_ptr = host_buf[hslot];
             }
 
             // Step B (H2D copy)
@@ -922,9 +1002,12 @@ void transfer_kv_blocks(
                             cudaMemcpyHostToDevice, stream);
             FLEXKV_GPU_CPU_TRANSFER(true, buffer_size_bytes);
 
-            if (need_pp_events) {
-              cudaEventRecord(pp_events[idx], stream);
-              pp_used[idx] = true;
+            // Mark this staging slot as having an in-flight H2D reading it so a
+            // later iteration/call reusing the slot waits on it before
+            // overwriting (also keeps pp_used semantics for D2H untouched).
+            if (need_pp_events && hslot >= 0) {
+              cudaEventRecord(pp_events[hslot], stream);
+              pp.inflight[hslot] = true;
             }
 
             // Step C (GPU scatter, when !dst_contig)
