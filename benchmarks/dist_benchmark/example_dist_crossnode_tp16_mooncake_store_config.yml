@@ -1,0 +1,34 @@
+# Cross-node TP16 (2 nodes x 8 GPU) + INDEXER validation — mooncake-store backend.
+# One FlexKV instance whose TP group spans 2 machines (nnodes=2, tp_size=16,
+# pp_size=1 -> tp_size_per_node=8, nnodes_per_tp_group=2).
+# GLM5-style: MLA (num_kv_heads=1, latent replicated across TP) + DSA indexer.
+# Representative synthetic dims (no real weights).
+
+num_layers: 4
+num_kv_heads: 1
+head_size: 576          # MLA latent (kv_lora_rank 512 + qk_rope 64), representative
+dtype: bfloat16
+use_mla: true
+tp_size: 16             # GLOBAL tp; spans 2 nodes (8 per node)
+dp_size: 1
+tokens_per_block: 64
+
+cpu_cache_gb: 8
+ssd_cache_gb: 0
+
+indexer:
+  head_size: 128
+  num_kv_heads: 1
+  dtype: uint8
+
+use_mooncake_store_backend: true
+# mooncake_master runs on Node A (bond0 IP). BOTH nodes point here.
+mooncake_master_addr: "29.74.107.134:50051"
+mooncake_metadata_server: "P2PHANDSHAKE"
+mooncake_protocol: "tcp"
+mooncake_device_name: "mlx5_bond_0"
+mooncake_local_hostname: "29.74.107.134"    # overridden per node via --local-hostname
+mooncake_global_segment_size_gb: 8
+mooncake_master_metrics_port: 9003
+
+server_client_mode: false

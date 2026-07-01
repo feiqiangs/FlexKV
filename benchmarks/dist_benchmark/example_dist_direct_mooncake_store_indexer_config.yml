@@ -1,0 +1,48 @@
+# Single-node tp=8 + INDEXER validation config — mooncake-store backend (direct mode)
+#
+# Goal (design-review "step 1"): validate the DSA/NSA *indexer* distributed-sharing
+# plumbing of the mooncake-store backend on real hardware, on ONE node.
+#   - MLA main-KV pool  ("<hash>_FlexKV")
+#   - indexer side-car  ("<hash>_FlexKV_indexer")
+# A cold-cache GET must hit ONLY when BOTH pools are present (multi-pool match),
+# proving the indexer pool is written/read/shared alongside the main KV.
+#
+# Run: one PUT process (tp=8, stays alive holding the RDMA segment) + one fresh
+# GET process (tp=8, cold local cache) on the SAME node. GPUs are shared via MPS.
+#
+# NOTE: the model dims below are REPRESENTATIVE of an MLA + DSA-indexer model
+# (GLM5 / DeepSeek-style); they exercise the plumbing with synthetic buffers and
+# do NOT require loading real weights. Adjust to the real GLM5 dims when wiring
+# through sglang.
+
+# ---- Model config (MLA: single shared latent, num_kv_heads=1) ----
+num_layers: 4
+num_kv_heads: 1
+head_size: 576          # MLA latent width (kv_lora_rank 512 + qk_rope 64), representative
+dtype: bfloat16
+use_mla: true
+tp_size: 8              # single-node tp=8 (needs 8 GPUs)
+dp_size: 1
+tokens_per_block: 64    # one "page"; indexer maps 1:1 with these blocks
+
+# ---- Cache config ----
+cpu_cache_gb: 8
+ssd_cache_gb: 0
+
+# ---- Indexer side-car pool (DSA/NSA). Presence of this block enables PoolKind.INDEXER ----
+indexer:
+  head_size: 128        # packed per-page indexer width (index_head_dim + scale bytes), representative
+  num_kv_heads: 1       # MLA-style indexer
+  dtype: uint8          # fp8-quantized indexer storage
+
+# ---- mooncake-store backend ----
+use_mooncake_store_backend: true
+mooncake_master_addr: "29.74.107.134:50051"
+mooncake_metadata_server: "P2PHANDSHAKE"
+mooncake_protocol: "tcp"                      # "rdma" or "tcp"
+mooncake_device_name: "mlx5_bond_0"
+mooncake_local_hostname: "29.74.107.134"
+mooncake_global_segment_size_gb: 8
+mooncake_master_metrics_port: 9003
+
+server_client_mode: false

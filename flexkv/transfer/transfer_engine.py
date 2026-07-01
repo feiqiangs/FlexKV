@@ -40,6 +40,7 @@ from flexkv.transfer.worker import (
     GDSTransferWorker,
     tpGDSTransferWorker,
     PEER2CPUTransferWorker,
+    MooncakeStoreTransferWorker,
 )
 from flexkv.transfer.layerwise import (
     LayerwiseTransferWorker,
@@ -47,6 +48,7 @@ from flexkv.transfer.layerwise import (
 )
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.ring_buffer import SharedOpPool
+from flexkv.external.mooncake_store_keys import PoolKind
 
 
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
@@ -321,6 +323,23 @@ class TransferEngine:
             )
             self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
             self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+        elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+              and self._cpu_handle is not None):
+            # mooncake-store backend: no _remote_handle (StorageEngine skips RemoteAllocator),
+            # but we still need workers for H2REMOTE and REMOTE2H.
+            self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                cache_config=self.cache_config,
+                pool_kind=PoolKind.KV,
+            )
+            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
+            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            flexkv_logger.info("[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
         if self.cache_config.enable_gds:
             if self.model_config.effective_tp_size_per_node == 1:
                 self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
@@ -587,6 +606,27 @@ class TransferEngine:
                 self._indexer_worker_map[TransferType.H2REMOTE] = self._indexer_h2remote_worker
                 self._indexer_worker_map[TransferType.REMOTE2H] = self._indexer_remote2h_worker
                 flexkv_logger.info("TransferEngine: indexer Remote workers initialized")
+            elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
+                  and self._indexer_cpu_handle is not None):
+                # mooncake-store backend for indexer (sidecar pool, pure-client mode).
+                self._indexer_mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self._indexer_finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    cpu_blocks=self._indexer_cpu_handle.get_worker_tensor(),
+                    cpu_kv_layout=self._indexer_cpu_handle.kv_layout,
+                    dtype=self._indexer_cpu_handle.dtype,
+                    cache_config=self.cache_config,
+                    pool_kind=PoolKind.INDEXER,
+                    override_global_segment_size=0,
+                )
+                self._indexer_worker_map[TransferType.H2REMOTE] = self._indexer_mooncake_store_worker
+                self._indexer_worker_map[TransferType.REMOTE2H] = self._indexer_mooncake_store_worker
+                flexkv_logger.info(
+                    f"[TransferEngine] indexer mooncake-store worker initialized "
+                    f"(pool_kind={PoolKind.INDEXER.name}/'{PoolKind.INDEXER.value}', "
+                    f"global_segment_size=0 / pure-client mode)"
+                )
             if self.cache_config.enable_gds and self._indexer_ssd_handle is not None:
                 if self.model_config.effective_tp_size_per_node == 1:
                     self._indexer_gds_workers: Dict[WorkerKey, WorkerHandle] = {
@@ -1201,6 +1241,15 @@ class TransferEngine:
                             src_block_ids=op.src_block_ids.copy(),
                             dst_block_ids=op.dst_block_ids.copy(),
                             dp_client_id=op.dp_client_id,
+                            # propagate mooncake-store addressing so the INDEXER
+                            # H2REMOTE/REMOTE2H worker can build per-block keys
+                            # (without this, _preprocess's assert fails silently).
+                            mooncake_store_block_hashes=(
+                                op.mooncake_store_block_hashes.copy()
+                                if op.mooncake_store_block_hashes is not None else None),
+                            src_block_node_ids=(
+                                op.src_block_node_ids.copy()
+                                if op.src_block_node_ids is not None else None),
                         )
                         register_op_to_buffer(indexer_replica, self.pin_buffer)
                         self._child_id_to_child[indexer_replica.op_id] = indexer_replica
@@ -1223,6 +1272,13 @@ class TransferEngine:
                         src_block_ids=op.src_block_ids.copy(),
                         dst_block_ids=op.dst_block_ids.copy(),
                         dp_client_id=op.dp_client_id,
+                        # propagate mooncake-store addressing (see dict branch above).
+                        mooncake_store_block_hashes=(
+                            op.mooncake_store_block_hashes.copy()
+                            if op.mooncake_store_block_hashes is not None else None),
+                        src_block_node_ids=(
+                            op.src_block_node_ids.copy()
+                            if op.src_block_node_ids is not None else None),
                     )
                     register_op_to_buffer(indexer_op, self.pin_buffer)
                     self._child_id_to_child[indexer_op.op_id] = indexer_op

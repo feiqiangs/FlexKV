@@ -1,0 +1,43 @@
+# Distributed KVCache benchmark config — mooncake-store backend (direct mode)
+#
+# Two-node shared-KVCache correctness test:
+#   Node A (PUT) writes KV blocks into the mooncake-store distributed pool.
+#   Node B (GET) — with a COLD local cache — fetches them, proving cross-node sharing.
+#
+# NOTE: mooncake-store does NOT use redis/etcd for the basic path.
+#   metadata_server = "P2PHANDSHAKE" (no external metadata service needed)
+#   a single `mooncake_master` service must be running (default port 50051).
+#   etcd is only needed for master high-availability (not used here).
+
+# ---- Model config ----
+num_layers: 4
+num_kv_heads: 8
+head_size: 128
+dtype: bfloat16
+use_mla: false
+tp_size: 1
+dp_size: 1
+tokens_per_block: 16
+
+# ---- Cache config ----
+cpu_cache_gb: 4
+ssd_cache_gb: 0
+
+# ---- mooncake-store backend ----
+use_mooncake_store_backend: true
+# The mooncake master service address (start with: mooncake_master --enable_http_metadata_server=true).
+# For a two-node test, run one master (e.g. on Node A) and point BOTH nodes here.
+mooncake_master_addr: "10.206.0.9:50051"
+mooncake_metadata_server: "P2PHANDSHAKE"     # no external metadata service; P2P handshake
+mooncake_protocol: "rdma"                     # "rdma" or "tcp"
+# RDMA NIC to use for THIS node (one of the 8 mellanox, bonded on these hosts).
+# Leave "" for auto-discovery. Override per node via --device-name.
+mooncake_device_name: "mlx5_bond_0"
+# Local RDMA hostname/IP of THIS node (MUST differ per node). Override per node via --local-hostname.
+mooncake_local_hostname: "10.206.0.9"
+# Memory (GB) this node contributes to the global pool.
+mooncake_global_segment_size_gb: 4
+mooncake_master_metrics_port: 9003
+
+# Direct mode (non-server_client_mode)
+server_client_mode: false

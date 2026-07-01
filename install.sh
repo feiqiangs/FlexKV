@@ -14,6 +14,10 @@
 #   --enable-p2p      Enable distributed P2P/Redis support (default: enabled)
 #   --disable-p2p     Disable distributed P2P/Redis support
 #   --mooncake-version VER  Mooncake release tag to build from source (default: latest main branch)
+#   --enable-mooncake-store Also build/install the mooncake-store Python SDK
+#                           (sets -DWITH_STORE=ON). Default: disabled, so the
+#                           existing transfer-engine-only build/CI is untouched.
+#                           Can also be toggled via env FLEXKV_BUILD_MOONCAKE_STORE=1.
 #   --enable-gds      Enable GDS support
 #   --enable-cfs      Enable CFS support
 #   --skip-deps       Skip system dependency installation
@@ -33,6 +37,10 @@ ENABLE_CFS=0
 SKIP_DEPS=0
 CLEAN_ONLY=0
 MOONCAKE_VERSION=""
+# mooncake-store Python SDK build is OFF by default so the existing
+# transfer-engine-only build (and current CI) is not affected. Enable via
+# --enable-mooncake-store or env FLEXKV_BUILD_MOONCAKE_STORE=1.
+BUILD_MOONCAKE_STORE="${FLEXKV_BUILD_MOONCAKE_STORE:-0}"
 
 # Use sudo only if not running as root
 if [ "$(id -u)" -eq 0 ]; then
@@ -55,7 +63,7 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 usage() {
-    head -n 17 "$0" | tail -n 14 | sed 's/^# \?//'
+    head -n 25 "$0" | tail -n 21 | sed 's/^# \?//'
     exit 0
 }
 
@@ -94,6 +102,10 @@ while [[ $# -gt 0 ]]; do
         --mooncake-version)
             MOONCAKE_VERSION="$2"
             shift 2
+            ;;
+        --enable-mooncake-store)
+            BUILD_MOONCAKE_STORE=1
+            shift
             ;;
         --enable-gds)
             ENABLE_GDS=1
@@ -406,13 +418,23 @@ if [ "$ENABLE_P2P" -eq 1 ]; then
         CMAKE_EXTRA_FLAGS="-DCMAKE_EXE_LINKER_FLAGS=-L${CUDA_STUBS_PATH}"
     fi
 
+    # mooncake-store SDK is only built when explicitly requested
+    # (--enable-mooncake-store / FLEXKV_BUILD_MOONCAKE_STORE=1). Default OFF so
+    # the existing transfer-engine-only build is byte-for-byte unchanged.
+    if [ "$BUILD_MOONCAKE_STORE" -eq 1 ]; then
+        WITH_STORE_FLAG="ON"
+        info "mooncake-store Python SDK build ENABLED (-DWITH_STORE=ON)"
+    else
+        WITH_STORE_FLAG="OFF"
+    fi
+
     cmake -G Ninja .. \
         -DWITH_TE=ON \
         -DUSE_REDIS=ON \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=OFF \
         -DUSE_CUDA=ON \
-        -DWITH_STORE=OFF \
+        -DWITH_STORE="$WITH_STORE_FLAG" \
         -DWITH_P2P_STORE=OFF \
         -DWITH_EP=OFF \
         -DWITH_METRICS=OFF \
@@ -469,6 +491,18 @@ from mooncake import engine
 e = engine.TransferEngine()
 print('mooncake-transfer-engine loaded successfully (built from source with Redis support)')
 " && success "mooncake verification passed!" || warn "mooncake verification had warnings, see above."
+
+    # Verify mooncake-store Python SDK (only when it was requested).
+    # The store SDK ships inside the same mooncake wheel built above when
+    # -DWITH_STORE=ON, so no extra pip install is needed.
+    if [ "$BUILD_MOONCAKE_STORE" -eq 1 ]; then
+        info "Verifying mooncake-store Python SDK..."
+        python3 -c "
+from mooncake.store import MooncakeDistributedStore
+print('mooncake-store Python SDK loaded successfully (MooncakeDistributedStore available)')
+" && success "mooncake-store SDK verification passed!" \
+          || warn "mooncake-store SDK not importable; ensure the wheel was built with -DWITH_STORE=ON."
+    fi
 fi
 
 # ======================== Step 5: Install Python Package ========================
@@ -534,6 +568,7 @@ if [ "$ENABLE_P2P" -eq 1 ]; then
     else
         info "Mooncake:         Built from source (latest) with Redis metadata backend"
     fi
+    info "Mooncake-store:   $([ "$BUILD_MOONCAKE_STORE" -eq 1 ] && echo 'Built (WITH_STORE=ON, SDK installed)' || echo 'Skipped (transfer-engine only)')"
 fi
 info "GDS:              $([ $ENABLE_GDS -eq 1 ] && echo 'Enabled' || echo 'Disabled')"
 info "CFS:              $([ $ENABLE_CFS -eq 1 ] && echo 'Enabled' || echo 'Disabled')"

@@ -138,6 +138,51 @@ class TransferManager:
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
         num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
+
+        # mooncake-store key layer-range (single-node AND cross-node PP).
+        #
+        # build_key's Case1/Case2 decision depends ONLY on whether the node-local
+        # CPU pool covers the full model, i.e. (node_layer_end - node_layer_start)
+        # == total_layers.  Since end - start == num_layers_on_node, the absolute
+        # node_min offset cancels out and has NO effect on the mooncake key; in
+        # the reference impl node_min only feeds worker_key_to_start_layer_id (a
+        # C++ PP-offset feature we intentionally do NOT port).  Therefore we can
+        # always set node_layer_start=0 and node_layer_end=num_layers_on_node,
+        # which is correct for both single-node (==total -> Case1, no suffix) and
+        # cross-node PP (<total -> Case2 _pp_rank_<i>_of_<N> suffix, where the
+        # pp_rank/pp_size come from cache_config injected by dev-core).
+        #
+        # This uses ONLY existing P800 fields (gpu layouts + pp_rank mapping):
+        # no new protocol field (pp_start_layer) and no TransferEngine
+        # worker_key_to_start_layer_id parameter are required.
+        if self.cache_config.use_mooncake_store_backend:
+            # Node-local CPU pool layer count = sum of num_layer over each
+            # distinct pp_rank that registered on this node (single-node PP>1
+            # shares one TransferManager across pp_ranks, so it must cover all
+            # their ranges, not just one pp_stage).
+            pp_rank_to_num_layers: Dict[int, int] = {}
+            for device_id, layout in self.all_gpu_layouts.items():
+                pp_rank = self.gpu_worker_key_mapping[device_id].pp_rank
+                pp_rank_to_num_layers.setdefault(pp_rank, layout.num_layer)
+            num_layers_on_node = sum(pp_rank_to_num_layers.values())
+
+            total = int(getattr(self.cache_config, 'mooncake_store_total_layers', 0) or 0) \
+                or int(self.model_config.num_layers)
+            self.cache_config.mooncake_store_total_layers = total
+            # node_min cancels in end-start; start=0 is sufficient. end-start ==
+            # num_layers_on_node drives the Case1/Case2 (no-suffix / pp-suffix).
+            self.cache_config.mooncake_store_node_layer_start = 0
+            self.cache_config.mooncake_store_node_layer_end = int(num_layers_on_node)
+            flexkv_logger.info(
+                f"mooncake key range: node_layer_start=0, "
+                f"node_layer_end={num_layers_on_node}, total_layers={total} "
+                f"(pp_rank_to_num_layers={pp_rank_to_num_layers}, "
+                f"{'full-model node -> Case1 (no suffix)' if num_layers_on_node == total else 'partial node -> Case2 (pp_rank suffix)'})")
+
+        # NOTE: StorageEngine still receives num_layers_per_pp_stage (P800
+        # original behaviour). We deliberately do NOT switch it to
+        # num_layers_on_node: that is an upstream PP-pool refactor (drift) and
+        # is out of scope for this port (C2).
         self.storage_engine = StorageEngine(
             self.model_config,
             self.cache_config,
@@ -174,9 +219,13 @@ class TransferManager:
             if self.cache_config.enable_cpu else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
+        # mooncake-store backend does not use RemoteAllocator; the remote tier
+        # is managed directly by MooncakeStoreTransferWorker, so keep
+        # remote_handle=None even though enable_remote is True for mooncake.
+        use_mooncake_store = self.cache_config.use_mooncake_store_backend
         remote_handle = (
             self.storage_engine.get_storage_handle(DeviceType.REMOTE) \
-            if self.cache_config.enable_remote \
+            if self.cache_config.enable_remote and not use_mooncake_store \
             else None
         )
 
@@ -438,6 +487,26 @@ class TransferManagerOnRemote(TransferManager):
         Otherwise, store graph in pending_graphs for later matching.
         """
         task_id = graph.graph_id  # Use graph_id as task_id for matching
+
+        # Cross-node TP: the master submits the graph WITHOUT clearing GPU
+        # blocks (TP ranks share the same slot_mapping), so it arrives here
+        # ready-to-run. No set_slot_mapping is ever sent in TP mode, so we must
+        # submit immediately -- otherwise the graph would sit in _pending_graphs
+        # forever, the remote would never report completion, and the master's
+        # wait() (which needs BOTH the local and remote handles to report the
+        # graph completed) would time out. Cross-node PP clears the blocks first
+        # (has_gpu_blocks_set() -> False) and still falls through to the
+        # slot_mapping-based pending path below.
+        if graph.has_gpu_blocks_set():
+            with self._active_graphs_lock:
+                self._active_graphs[graph.graph_id] = task_end_op_id
+            flexkv_logger.debug(
+                f"[TransferManagerOnRemote] submit: graph for task_id={task_id} "
+                f"submitted immediately (cross-node TP, GPU blocks already set)"
+            )
+            self.submit(graph)
+            return
+
         with self._pending_lock:
             if task_id in self._pending_slot_mappings:
                 # slot_mapping already arrived, set GPU blocks and submit

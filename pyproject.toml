@@ -7,6 +7,11 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+markers = [
+    "mooncake: tests that require a real mooncake-store cluster / RDMA fabric (hardware-only, skipped offline)",
+]
+
 [tool.ruff]
 # Allow lines to be as long as 120.
 line-length = 120

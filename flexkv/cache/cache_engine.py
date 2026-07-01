@@ -378,6 +378,8 @@ class GlobalCacheEngine:
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
 
+        self.use_mooncake_store_backend = cache_config.use_mooncake_store_backend
+
         # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
         self._metrics_collector = get_global_collector()
         if self._metrics_collector is None:
@@ -444,7 +446,20 @@ class GlobalCacheEngine:
                                                 self._metrics_collector)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            if cache_config.enable_kv_sharing:
+            if self.use_mooncake_store_backend:
+                # mooncake-store: global distributed KV cache pool.
+                # The engine does not manage local block IDs; it resolves blocks
+                # by content-hash keys via MooncakeStoreClient.batch_exists().
+                from flexkv.external.mooncake_store_utils import (
+                    MooncakeStoreCacheEngine,
+                )
+                # PP rank/size already populated on cache_config by
+                # update_default_config_from_user_config (single injection
+                # point sourced from RankInfo). Just consume it.
+                self.remote_cache_engine = MooncakeStoreCacheEngine(
+                    cache_config=cache_config,
+                )
+            elif cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
                 self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.index_accel:
@@ -655,7 +670,7 @@ class GlobalCacheEngine:
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel
+        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel and not self.use_mooncake_store_backend
         remote_file_nodeids = None
         if shared_pcfs_read:
             remote_file_nodeids = remote_matched_result.block_node_ids
@@ -746,6 +761,16 @@ class GlobalCacheEngine:
 
         op_remote2h = None
         if fragment3_num_blocks > 0:
+            # For mooncake-store, pass content-hash keys so the transfer worker
+            # can address blocks by hash instead of file offset.
+            if self.use_mooncake_store_backend:
+                mooncacke_block_hashes = sequence_meta.block_hashes[
+                    block_mask_start + fragment12_num_blocks:
+                    block_mask_start + fragment12_num_blocks + fragment3_num_blocks
+                ]
+                assert len(mooncacke_block_hashes) == len(fragment3_remote_blocks)
+            else:
+                mooncacke_block_hashes = None
             op_remote2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.REMOTE2H,
@@ -753,6 +778,7 @@ class GlobalCacheEngine:
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                 src_block_node_ids = fragment3_remote_file_nodeids,
                 dp_client_id = dp_client_id,
+                mooncake_store_block_hashes = mooncacke_block_hashes,
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -1254,12 +1280,21 @@ class GlobalCacheEngine:
                                                   cpu_matched_blocks[-extra_num_cpu_blocks:]])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
+            if self.use_mooncake_store_backend:
+                mooncacke_block_hashes = sequence_meta.block_hashes[
+                    block_mask_start + len(remote_matched_blocks):
+                    block_mask_start + len(remote_matched_blocks) + fragment3_num_blocks
+                ]
+                assert len(mooncacke_block_hashes) == len(fragment3_cpu_blocks)
+            else:
+                mooncacke_block_hashes = None
             op_h2remote = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2REMOTE,
                 src_block_ids = fragment3_cpu_blocks,
                 dst_block_ids = fragment3_remote_blocks,
                 dp_client_id = dp_client_id,
+                mooncake_store_block_hashes = mooncacke_block_hashes,
             )
             transfer_graph.add_transfer_op(op_h2remote)
             transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)

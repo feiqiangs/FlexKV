@@ -412,6 +412,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
+            0,              # start_layer_id=0: GPU tensor is PP-stage-local (0-indexed);
+                            # CPU pool offset is baked into self.cpu_tensor pointer.
+                            # (was MISSING -> positional args shifted by one:
+                            #  transfer_num_cta received is_H2D bool (=0 for D2H) -> gridDim=0
+                            #  -> cudaErrorInvalidConfiguration; and use_ce_transfer received
+                            #  is_mla, so the CE flag was silently ignored.)
             self.num_layers,
             transfer_num_cta,
             transfer_type == TransferType.H2D,
@@ -2201,3 +2207,218 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+
+# ---------------------------------------------------------------------------
+# MooncakeStoreTransferWorker
+# ---------------------------------------------------------------------------
+# NOTE: appended at end-of-file on purpose so that the P800 CE-optimized
+# GPUCPUTransferWorker / tpGPUCPUTransferWorker (and their use_ce_transfer_* /
+# transfer_num_cta_* / _safe_checksum / timed launch_transfer paths) above are
+# left completely untouched (constraint C1).  This module-level import is also
+# part of the appended block — the file header above is intentionally not
+# modified.
+from flexkv.external.mooncake_store_keys import PoolKind, build_key  # noqa: E402
+
+
+class MooncakeStoreTransferWorker(TransferWorkerBase):
+    """
+    Transfer worker that uses mooncake-store for remote KV cache I/O.
+
+    Transfer semantics
+    * **H2REMOTE (PUT)**: build (key, ptr, size) triples that point directly
+      into the hot-CPU buffer and call ``batch_put``.
+
+    * **REMOTE2H (GET)**: call ``batch_get`` directly with pointers into the
+      hot-CPU buffer.
+
+    Addressing
+    Key format: ``"{block_hash}_{kind.value}"`` — one key per block (all layers are stored
+    together as a single contiguous slab under one key for each kind).
+
+    This worker only touches already-registered host (CPU) memory + RDMA;
+    it does NOT introduce any GPU/CUDA/csrc code (constraint C3).
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: Union[List[torch.Tensor], torch.Tensor],
+        cpu_kv_layout: "KVCacheLayout",
+        dtype: torch.dtype,
+        cache_config: "CacheConfig",
+        pool_kind: PoolKind = PoolKind.KV,
+        override_global_segment_size: Optional[int] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        cpu_blocks:
+            Hot-CPU KV cache tensor (flat, from
+            ``StorageHandle.get_worker_tensor()``).
+        cpu_kv_layout:
+            KVCacheLayout for the hot-CPU slab.
+        dtype:
+            Element dtype of the KV tensors.
+        cache_config:
+            CacheConfig used to load MooncakeStoreConfig via
+            ``MooncakeStoreConfig.from_file()``.
+        pool_kind:
+            Namespace of the keys written/read by this worker. The main KV
+            worker uses the default ``PoolKind.KV`` (``"FlexKV"``); sidecar
+            workers (e.g. indexer) should use a distinct kind (e.g.
+            ``PoolKind.INDEXER`` -> ``"FlexKV_indexer"``) to keep their objects
+            separate in the global Mooncake namespace.
+        override_global_segment_size:
+            If set, overrides the ``global_segment_size`` from the JSON config.
+            Pass ``0`` to create a *pure-client* worker that does NOT contribute
+            its own segment to the cluster pool. Use this for sidecar workers
+            (e.g. indexer) so we do not waste memory on duplicate segments.
+        """
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        # Single source of truth: cache_config carries PP / layer-range info
+        # populated by update_default_config_from_user_config (pp_rank/pp_size/
+        # total_layers) plus transfer_manager (node_layer_start/end after the
+        # GPU registration phase).  Defaults keep pp_size==1 callers untouched.
+        self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
+        self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
+        self.node_layer_start = int(getattr(cache_config, 'mooncake_store_node_layer_start', 0) or 0)
+        self.node_layer_end = int(getattr(cache_config, 'mooncake_store_node_layer_end', 0) or 0)
+        self.total_layers = int(getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
+
+        self.suffix_str = pool_kind.value
+        self.pool_kind = pool_kind
+        # ---- Hot CPU region ------------------------------------------------
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        flexkv_logger.info(
+            f"Pinning CPU Memory: "
+            f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB"
+        )
+        # Reuse the P800-native cudaHostRegister (constraint R4); do NOT adapt it.
+        cudaHostRegister(cpu_blocks)
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+
+        self.num_layers: int = cpu_kv_layout.num_layer
+        self.num_cpu_blocks: int = cpu_kv_layout.num_block
+        self.block_size = cpu_kv_layout.get_chunk_size()
+        self.dtype: torch.dtype = dtype
+
+        self.cpu_kv_layout = cpu_kv_layout
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+
+        self.is_mla: bool = cpu_kv_layout.is_mla
+        self.kv_dim = 2 if not self.is_mla else 1
+
+        self.cpu_blocks = cpu_blocks
+        self.cache_config = cache_config
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+
+        # ---- mooncake-store client -----------------------------------------
+        from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
+        store_config = MooncakeStoreConfig.from_file(
+            self.cache_config,
+            override_global_segment_size=override_global_segment_size,
+        )
+        self.mooncake_client = MooncakeStoreClient(store_config)
+
+        # Register hot CPU buffer directly for mooncake-store access (zero extra
+        # staging: RDMA reads/writes happen in-place on this buffer).
+        self.mooncake_client.register_buffer(self._cpu_buffer)
+        flexkv_logger.info(
+            f"[MooncakeStoreTransferWorker:{self.suffix_str}] Registered hot CPU buffer "
+            f"ptr=0x{self._cpu_buffer.data_ptr():x} "
+            f"size={self._cpu_buffer.numel() * self._cpu_buffer.element_size()} B "
+            f"({self.num_cpu_blocks} blocks x {self.num_layers} layers), "
+            f"global_segment_size={store_config.global_segment_size}"
+        )
+
+    # ------------------------------------------------------------------
+    # TransferWorkerBase interface
+    # ------------------------------------------------------------------
+
+    def _transfer_impl(  # type: ignore[override]
+        self,
+        cpu_ptrs: List[int],
+        block_sizes: List[int],
+        keys: List[str],
+        transfer_type: TransferType,
+    ) -> None:
+        # NOTE: the debug-log gate below uses ``!= "0"`` (only enabled when
+        # FLEXKV_DEBUG_MOONCAKE_STORE is set to a non-"0" value). This fixes a
+        # always-true bug in the reference implementation (a non-empty default
+        # string "0" is truthy) and aligns with detailed-design §9.1 semantics
+        # (``FLEXKV_DEBUG_MOONCAKE_STORE=1`` turns the log on).
+        if transfer_type == TransferType.H2REMOTE:
+            put_ok = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            if os.environ.get("FLEXKV_DEBUG_MOONCAKE_STORE", "0") != "0":
+                flexkv_logger.info(
+                    f"[MooncakeStoreTransferWorker] H2REMOTE transfer keys: {keys}, "
+                    f"ok={sum(put_ok)}, fail={len(keys) - sum(put_ok)}"
+                )
+        elif transfer_type == TransferType.REMOTE2H:
+            get_ok = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+            if os.environ.get("FLEXKV_DEBUG_MOONCAKE_STORE", "0") != "0":
+                flexkv_logger.info(
+                    f"[MooncakeStoreTransferWorker] REMOTE2H transfer keys: {keys}, "
+                    f"ok={sum(get_ok)}, fail={len(keys) - sum(get_ok)}"
+                )
+        else:
+            raise ValueError(
+                f"[MooncakeStoreTransferWorker] Invalid transfer type: {transfer_type} "
+                "for mooncake-store transfer worker. "
+                "Only H2REMOTE and REMOTE2H are supported."
+            )
+
+    def launch_transfer(self, transfer_op: "WorkerTransferOp") -> bool:  # type: ignore[override]
+        # Self-contained, slimmed-down launch path for the mooncake worker.
+        # It does NOT share the P800 GPUCPU worker's CE timing / checksum logic.
+        cpu_ptrs, block_sizes, keys = self._preprocess(transfer_op)
+        transfer_type = transfer_op.transfer_type
+        start_time = time.time()
+        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_type)
+        end_time = time.time()
+
+        transfer_size = sum(block_sizes)
+        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
+        return True
+
+    # ------------------------------------------------------------------
+    # internal helper functions
+    # ------------------------------------------------------------------
+
+    def _preprocess(self, transfer_op: "WorkerTransferOp") -> Tuple[List[int], List[int], List[str]]:
+        # REMOTE2H: fill CPU (dst); H2REMOTE: read from CPU (src)
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.mooncake_store_block_hashes is not None
+        elements_per_block = self.cpu_kv_layout.get_elements_per_block()
+
+        block_size_bytes = elements_per_block * self.dtype.itemsize
+        cpu_ptrs: List[int] = []
+        block_sizes: List[int] = []
+        keys: List[str] = []
+        base_ptr = self._cpu_buffer.data_ptr()
+        for i, blk_id in enumerate(cpu_block_ids):
+            cpu_ptr = base_ptr + blk_id * block_size_bytes
+            key = build_key(
+                transfer_op.mooncake_store_block_hashes[i],
+                self.pool_kind,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            )
+            cpu_ptrs.append(cpu_ptr)
+            block_sizes.append(block_size_bytes)
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self, transfer_op: "WorkerTransferOp") -> None:
+        pass
