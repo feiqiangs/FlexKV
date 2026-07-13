@@ -18,6 +18,7 @@ Three public objects are exposed:
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Set, Union, Any, List, TYPE_CHECKING
 
@@ -40,6 +41,42 @@ if TYPE_CHECKING:
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600
+
+# ---------------------------------------------------------------------------
+# I/O watchdog timeout
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (found via P800 5P5D benchmark, 2026-07-11): the mooncake-store
+# Python SDK calls (``batch_is_exist`` / ``batch_get_into`` / ``batch_put_from``)
+# are synchronous native (pybind11) calls with NO timeout of their own. They
+# are invoked directly on the sglang **scheduler main thread** (via
+# ``FlexKVConnector.get_new_hit_length`` -> ``KVManager.get_match`` ->
+# ``KVTaskEngine`` -> ``MooncakeStoreCacheEngine.match`` in the non
+# server_client_mode / in-process path). Under certain conditions (observed:
+# very long prompts with low local-cache hit ratio, i.e. many remote keys to
+# check/fetch in one RPC) this call can hang indefinitely with the scheduler
+# process pegged at ~100% CPU (the RDMA client busy-polls for completion) and
+# ZERO forward progress -- confirmed by a controlled repro that hung for
+# >900s with no response, no error, and no FlexKV-level log line at all,
+# while ``mooncake_master`` and TCP-level connection stats showed no error
+# either (the connection was simply never fed by the native call).
+#
+# Because this call sits in the scheduler's synchronous hot path, a single
+# stuck remote KV lookup freezes the ENTIRE prefill instance (all other
+# requests queued behind it never get scheduled), which is far worse than a
+# single failed request.
+#
+# Fix: wrap every native store call in a bounded-wait watchdog. The native
+# call itself cannot be cancelled (no cooperative cancellation API exposed
+# by the SDK), so we run it in a daemon helper thread and only WAIT (with a
+# timeout) on the calling thread; if the timeout elapses we log full
+# diagnostics and return a safe "degraded" result (treat as miss/failure)
+# so the scheduler can make forward progress instead of hanging forever.
+# The helper thread is intentionally leaked in the timeout case (best-effort
+# cleanup only) since the native call has no cancellation hook; this trades
+# a bounded resource leak for eliminating an unbounded scheduler freeze.
+MOONCAKE_STORE_IO_TIMEOUT = float(
+    os.environ.get("FLEXKV_MOONCAKE_STORE_IO_TIMEOUT", "20")
+)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -134,6 +171,77 @@ class MooncakeStoreConfig:
 # ---------------------------------------------------------------------------
 
 
+def _run_with_timeout(
+    fn: "Any",
+    args: tuple,
+    timeout: float,
+    op_name: str,
+    on_timeout_result: "Any",
+) -> "Any":
+    """Run a blocking native call in a helper thread with a bounded wait.
+
+    The native mooncake-store SDK calls have no cancellation hook, so the
+    helper thread cannot actually be killed once the timeout elapses -- it is
+    left to finish (or hang) in the background as a daemon thread. The
+    calling thread (typically the sglang scheduler main thread) only ever
+    waits up to ``timeout`` seconds, guaranteeing bounded latency for the
+    *caller* even when the native call itself never returns. See the
+    module-level comment near ``MOONCAKE_STORE_IO_TIMEOUT`` for the full
+    root-cause writeup.
+    """
+    result: List[Any] = [None]
+    error: List[BaseException] = []
+
+    def _target() -> None:
+        try:
+            result[0] = fn(*args)
+        except BaseException as exc:  # noqa: BLE001 - re-raise info to caller thread
+            error.append(exc)
+
+    t0 = time.perf_counter()
+    thread = threading.Thread(target=_target, name=f"mooncake-io-{op_name}", daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        flexkv_logger.error(
+            f"[MooncakeStoreClient] TIMEOUT after {timeout:.1f}s waiting for "
+            f"native call '{op_name}' to return. The scheduler thread is now "
+            f"UNBLOCKED and will treat this call as failed/miss so forward "
+            f"progress continues; the underlying native call keeps running "
+            f"in a leaked daemon thread (best-effort, cannot be cancelled). "
+            f"This most likely indicates an RDMA-level stall against the "
+            f"mooncake master/segment (network, peer overload, or too many "
+            f"keys in one RPC). args_summary={_summarize_args(args)}"
+        )
+        return on_timeout_result
+
+    elapsed = time.perf_counter() - t0
+    if error:
+        flexkv_logger.error(
+            f"[MooncakeStoreClient] native call '{op_name}' raised after "
+            f"{elapsed:.2f}s: {error[0]!r}"
+        )
+        raise error[0]
+    if elapsed > timeout * 0.5:
+        flexkv_logger.warning(
+            f"[MooncakeStoreClient] native call '{op_name}' took {elapsed:.2f}s "
+            f"(>{timeout * 0.5:.1f}s, {timeout:.0f}s timeout budget) -- "
+            f"approaching the I/O watchdog threshold."
+        )
+    return result[0]
+
+
+def _summarize_args(args: tuple) -> str:
+    parts = []
+    for a in args:
+        if isinstance(a, (list, tuple)):
+            parts.append(f"len={len(a)}" + (f" first={a[0]!r}" if a else ""))
+        else:
+            parts.append(repr(a)[:80])
+    return ", ".join(parts)
+
+
 class MooncakeStoreClient:
     """
     Thin wrapper around ``mooncake.store.MooncakeDistributedStore`` that adds
@@ -141,6 +249,14 @@ class MooncakeStoreClient:
 
     The underlying store object is lazily created on first use to allow
     pickling of the config across process boundaries.
+
+    NOTE (I/O watchdog): every native RDMA call that can be invoked from the
+    sglang scheduler's synchronous hot path (``batch_is_exist`` /
+    ``batch_get_into`` / ``batch_put_from``) is wrapped with
+    ``_run_with_timeout`` (budget: ``FLEXKV_MOONCAKE_STORE_IO_TIMEOUT``,
+    default 20s) so that a stuck RDMA call can no longer freeze the entire
+    prefill instance. See the module-level comment for the root-cause
+    writeup that motivated this.
     """
 
     def __init__(self, config: MooncakeStoreConfig, query_only: bool = False) -> None:
@@ -345,7 +461,13 @@ class MooncakeStoreClient:
                 f"[MooncakeStoreClient] key {key} already exists, skip put"
             )
             return True
-        ret_code = self._store.batch_put_from([key], [buffer_ptr], [buffer_size])
+        ret_code = _run_with_timeout(
+            self._store.batch_put_from,
+            ([key], [buffer_ptr], [buffer_size]),
+            MOONCAKE_STORE_IO_TIMEOUT,
+            op_name="batch_put_from(single)",
+            on_timeout_result=[-1],
+        )
 
         return ret_code == 0
 
@@ -394,7 +516,13 @@ class MooncakeStoreClient:
         """Read a KV block from the store."""
         self._ensure_setup()
         assert buffer_ptr is not None and buffer_size is not None
-        ret_code = self._store.batch_get_into([key], [buffer_ptr], [buffer_size])
+        ret_code = _run_with_timeout(
+            self._store.batch_get_into,
+            ([key], [buffer_ptr], [buffer_size]),
+            MOONCAKE_STORE_IO_TIMEOUT,
+            op_name="batch_get_into(single)",
+            on_timeout_result=[-1],
+        )
         return ret_code[0] >= 0
 
     def batch_get(
@@ -426,20 +554,48 @@ class MooncakeStoreClient:
     def exists(self, key: str) -> bool:
         """Check existence of a key in the store."""
         self._ensure_setup()
-        result = self._store._batch_exist([key])
+        result = _run_with_timeout(
+            self._store._batch_exist,
+            ([key],),
+            MOONCAKE_STORE_IO_TIMEOUT,
+            op_name="_batch_exist(single)",
+            on_timeout_result=[0],
+        )
         return result[0] == 1
 
     def zero_copy_put_impl(
         self, keys_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
     ) -> List[int]:
-        """Write multiple KV blocks to the store in one call."""
-        return self._store.batch_put_from(keys_strs, buffer_ptrs, buffer_sizes)
+        """Write multiple KV blocks to the store in one call.
+
+        Wrapped with an I/O watchdog (see module-level comment): on timeout,
+        every key is reported as failed (non-zero) rather than hanging the
+        caller (typically the sglang scheduler thread) forever.
+        """
+        return _run_with_timeout(
+            self._store.batch_put_from,
+            (keys_strs, buffer_ptrs, buffer_sizes),
+            MOONCAKE_STORE_IO_TIMEOUT,
+            op_name="batch_put_from",
+            on_timeout_result=[-1] * len(keys_strs),
+        )
 
     def zero_copy_get_impl(
         self, keys_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
     ) -> List[int]:
-        """Read multiple KV blocks from the store in one call."""
-        return self._store.batch_get_into(keys_strs, buffer_ptrs, buffer_sizes)
+        """Read multiple KV blocks from the store in one call.
+
+        Wrapped with an I/O watchdog (see module-level comment): on timeout,
+        every key is reported as failed (negative bytes-read) rather than
+        hanging the caller forever.
+        """
+        return _run_with_timeout(
+            self._store.batch_get_into,
+            (keys_strs, buffer_ptrs, buffer_sizes),
+            MOONCAKE_STORE_IO_TIMEOUT,
+            op_name="batch_get_into",
+            on_timeout_result=[-1] * len(keys_strs),
+        )
 
     def batch_exists_impl(self, keys_strs: list[str]) -> List[int]:
         """Check existence of multiple keys in the store.
@@ -448,8 +604,21 @@ class MooncakeStoreClient:
                 1  = key exists,
                 0  = key not found,
                 -1 = store error.
+
+        Wrapped with an I/O watchdog (see module-level comment): on timeout,
+        every key is conservatively treated as "not found" (0) so that the
+        caller falls back to recomputing rather than hanging forever. This
+        is the exact call chain that caused a P800 5P5D scheduler to hang
+        for >900s on a single very-long-prompt / low-hit-ratio request
+        (2026-07-11 root cause investigation).
         """
-        return self._store.batch_is_exist(keys_strs)
+        return _run_with_timeout(
+            self._store.batch_is_exist,
+            (keys_strs,),
+            MOONCAKE_STORE_IO_TIMEOUT,
+            op_name="batch_is_exist",
+            on_timeout_result=[0] * len(keys_strs),
+        )
 
     def _check_success(self, results: List[int], is_set_operate: bool) -> List[bool]:
         # put: success when return == 0; get: success when return > 0 (bytes read)

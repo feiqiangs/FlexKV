@@ -406,9 +406,12 @@ class CacheConfig:
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
-        self.enable_remote = self.enable_3rd_remote
         self.use_mooncake_store_backend = self.use_mooncake_store_backend or \
             bool(int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', 0)))
+        # enable_remote 必须在 use_mooncake_store_backend 从 env 更新之后派生，
+        # 且算上 mooncake-store（与 make_cache_config 的派生一致），否则 sglang
+        # flexkv_connector 的 _prefetch_enabled 会因 enable_remote=False 而禁用远端前缀缓存。
+        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
         if self.use_mooncake_store_backend:
             if self.mooncake_store_config_path is None:
                 self.mooncake_store_config_path = os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None)
