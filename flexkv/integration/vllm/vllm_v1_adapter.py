@@ -267,6 +267,13 @@ class FlexKVSchedulerConnector:
                              and not self.cache_config.enable_remote
                              and not self.cache_config.enable_gds)
 
+        # Mamba state L2/L3 management (hybrid SSM models).
+        # Initialized lazily in _init_mamba_connector when mamba layers
+        # are detected during register_kv_caches.
+        self._mamba_connector = None
+        self._has_mamba = False
+        self._mamba_state_tensors = None  # (conv_state, ssm_state) refs
+
         while not self.is_ready():
             logger.info("Waiting for flexkv init...")
             time.sleep(5)
@@ -314,6 +321,22 @@ class FlexKVSchedulerConnector:
                                    num_computed_tokens=num_computed_tokens,
                                    num_new_matched_tokens=num_new_matched_tokens):
             return 0, False
+
+        # --- Mamba state L2/L3 lookup ---
+        # Check if FlexKV also has mamba state for this prefix.
+        # The mamba hit doesn't affect token KV match count, but we
+        # log it for stats. Restore happens in start_load_kv.
+        if self._has_mamba and self._mamba_connector is not None:
+            try:
+                token_ids = list(request.all_token_ids)[:num_computed_tokens + num_new_matched_tokens]
+                mamba_hit = self._mamba_connector.lookup(token_ids)
+                if mamba_hit[0]:  # (hit, matched_tokens)
+                    logger.debug(
+                        f"[FlexKV-Mamba] get_num_new_matched_tokens: "
+                        f"mamba hit={mamba_hit[1]} tokens for req={request.request_id}"
+                    )
+            except Exception:
+                pass
 
         return num_new_matched_tokens, True
 
@@ -523,7 +546,171 @@ class FlexKVSchedulerConnector:
         block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
         task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
 
+        # --- Mamba state L2/L3 store ---
+        # After token KV store, also snapshot mamba state to FlexKV.
+        if self._has_mamba and self._mamba_connector is not None:
+            try:
+                token_ids = list(request.all_token_ids)
+                mamba_state = self._get_request_mamba_state(request)
+                if mamba_state is not None:
+                    temporal, conv = mamba_state
+                    self._mamba_connector.store(token_ids, temporal, conv)
+            except Exception as exc:
+                logger.debug(f"[FlexKV-Mamba] store in request_finished failed: {exc}")
+
         return True
+
+    # ------------------------------------------------------------------
+    # Mamba state L2/L3 API (hybrid SSM models)
+    # ------------------------------------------------------------------
+
+    def _init_mamba_connector(self, kv_caches: dict) -> None:
+        """Detect mamba layers from kv_caches and init MambaStateConnectorBase.
+
+        In vLLM V1, mamba layers register [conv_state, ssm_state] as
+        kv_caches entries. We detect them by layer name patterns
+        ("ssm" or "conv" or "mamba") and read their tensor shapes.
+        """
+        from flexkv.mamba_state.connector_base import (
+            MambaStateConfig,
+            MambaStateConnectorBase,
+        )
+
+        mamba_layers = {}
+        conv_layers = {}
+        for layer_name, tensor in kv_caches.items():
+            name_lower = layer_name.lower()
+            # P1-2: Use precise suffix matching to avoid false positives
+            # (e.g. "conversation_layer" should not match "conv")
+            if name_lower.endswith("ssm_state") or name_lower.endswith("mamba_state"):
+                mamba_layers[layer_name] = tensor
+            elif name_lower.endswith("conv_state") or name_lower.endswith("mamba_conv"):
+                conv_layers[layer_name] = tensor
+
+        if not mamba_layers:
+            return
+
+        # Infer shape from first ssm_state tensor.
+        # vLLM ssm_state shape: [num_blocks, num_heads, head_size, head_size]
+        # or [max_batch_size, num_heads, head_size, head_size]
+        first_ssm = next(iter(mamba_layers.values()))
+        if first_ssm.ndim < 3:
+            return
+
+        num_layers = len(mamba_layers)
+        num_heads = first_ssm.shape[1] if first_ssm.ndim >= 3 else 1
+        head_v_dim = first_ssm.shape[2] if first_ssm.ndim >= 3 else first_ssm.shape[-1]
+        head_k_dim = head_v_dim  # P2-6: assume d_v == d_k (true for GDN; KDA needs verification)
+
+        # Conv state shapes
+        conv_shapes = []
+        if conv_layers:
+            first_conv = next(iter(conv_layers.values()))
+            conv_shapes.append(tuple(first_conv.shape[1:]))
+        else:
+            conv_shapes.append((4, num_heads * head_v_dim))  # fallback
+
+        config = MambaStateConfig(
+            num_linear_layers=num_layers,
+            num_heads=num_heads,
+            head_v_dim=head_v_dim,
+            head_k_dim=head_k_dim,
+            conv_shapes=conv_shapes,
+            conv_dtype=first_ssm.dtype,
+            temporal_dtype=first_ssm.dtype,
+            num_cpu_slots=int(os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "2048")),
+        )
+
+        self._mamba_connector = MambaStateConnectorBase(config)
+        self._mamba_state_tensors = {"ssm": mamba_layers, "conv": conv_layers}
+        self._has_mamba = True
+
+        logger.info(
+            f"[FlexKV-Mamba] vLLM mamba state L2/L3 enabled: "
+            f"layers={num_layers} heads={num_heads} d_v={head_v_dim}"
+        )
+
+    def _get_request_mamba_state(self, request: "Request"):
+        """Read mamba state tensors for a finished request.
+
+        In vLLM V1, the mamba state is managed by the scheduler's
+        MambaCacheManager. The per-request state is accessed through
+        the request's mamba state index.
+
+        Returns (temporal, conv) tensors or None if not available.
+        temporal shape: [L, H, d_v, d_k] (all layers stacked)
+        conv: list of [L, *conv_shape] tensors
+        """
+        mamba_cache = getattr(request, "mamba_state", None)
+        if mamba_cache is None:
+            mamba_cache = getattr(request, "mamba_cache", None)
+        if mamba_cache is None:
+            return None
+
+        # P1-6: vLLM returns per-layer state, we need to stack into [L, ...]
+        if isinstance(mamba_cache, (tuple, list)) and len(mamba_cache) >= 2:
+            conv_state, ssm_state = mamba_cache[0], mamba_cache[1]
+            # ssm_state might be [num_layers, H, d_v, d_k] or a list of per-layer
+            if isinstance(ssm_state, (list, tuple)):
+                ssm_state = torch.stack(list(ssm_state), dim=0)  # [L, H, d_v, d_k]
+            if isinstance(conv_state, (list, tuple)):
+                conv_state = torch.stack(list(conv_state), dim=0)  # [L, *conv_shape]
+            return ssm_state, [conv_state]
+        elif isinstance(mamba_cache, dict):
+            ssm = mamba_cache.get("ssm_state") or mamba_cache.get("temporal")
+            conv = mamba_cache.get("conv_state") or mamba_cache.get("conv")
+            if ssm is not None and conv is not None:
+                if isinstance(ssm, (list, tuple)):
+                    ssm = torch.stack(list(ssm), dim=0)
+                if isinstance(conv, (list, tuple)):
+                    conv = torch.stack(list(conv), dim=0)
+                return ssm, [conv]
+
+        return None
+
+    def retrieve_mamba_state(self, request: "Request") -> bool:
+        """Retrieve mamba state from FlexKV L2/L3 → write to request (CoW).
+
+        Called from FlexKVWorkerConnector.start_load_kv after token KV
+        load. Returns True if mamba state was restored.
+        """
+        if not self._has_mamba or self._mamba_connector is None:
+            return False
+
+        try:
+            token_ids = list(request.all_token_ids)
+            result = self._mamba_connector.retrieve(token_ids)
+            if result is None:
+                return False
+
+            temporal_cpu, conv_cpu = result
+
+            # Write to request's mamba state (CoW — stored checkpoint
+            # is not modified). The exact write path depends on vLLM
+            # version's mamba state API.
+            mamba_cache = getattr(request, "mamba_state", None)
+            if mamba_cache is None:
+                mamba_cache = getattr(request, "mamba_cache", None)
+            if mamba_cache is None:
+                return False
+
+            if isinstance(mamba_cache, (tuple, list)) and len(mamba_cache) >= 2:
+                # (conv_state, ssm_state) — write back
+                mamba_cache[0].copy_(conv_cpu[0], non_blocking=False)  # P1-3: sync
+                mamba_cache[1].copy_(temporal_cpu, non_blocking=False)  # P1-3: sync
+                return True
+            elif isinstance(mamba_cache, dict):
+                ssm = mamba_cache.get("ssm_state") or mamba_cache.get("temporal")
+                conv = mamba_cache.get("conv_state") or mamba_cache.get("conv")
+                if ssm is not None and conv is not None:
+                    ssm.copy_(temporal_cpu, non_blocking=False)  # P1-3: sync
+                    conv.copy_(conv_cpu[0], non_blocking=False)  # P1-3: sync
+                    return True
+
+            return False
+        except Exception as exc:
+            logger.debug(f"[FlexKV-Mamba] retrieve_mamba_state failed: {exc}")
+            return False
 
     def _put_match(
         self,
@@ -910,6 +1097,11 @@ class FlexKVWorkerConnector:
 
         logger.info("Finish register kv_caches")
 
+        # --- Mamba state detection ---
+        # After registering token KV, check if this is a hybrid SSM
+        # model and init mamba state L2/L3 if so.
+        self.connector._init_mamba_connector(kv_caches)
+
     def __del__(self):
         if hasattr(self, "remote_transfer_manager_process") and \
             self.remote_transfer_manager_process is not None:
@@ -982,7 +1174,18 @@ class FlexKVConnectorV1Impl:
             the same.
 
         """
-        pass
+        # --- Mamba state L2/L3 restore (CoW) ---
+        # After token KV load, also retrieve mamba state from FlexKV.
+        if (self.role == KVConnectorRole.SCHEDULER
+                and hasattr(self.connector, '_has_mamba')
+                and self.connector._has_mamba):
+            try:
+                # P2-5: forward_context.requests may vary across vLLM versions
+                # (some use .batch or .request_ids). Fallback to empty list.
+                for request in getattr(forward_context, 'requests', []) or getattr(forward_context, 'batch', []) or []:
+                    self.connector.retrieve_mamba_state(request)
+            except Exception as exc:
+                logger.debug(f"[FlexKV-Mamba] start_load_kv mamba retrieve: {exc}")
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """

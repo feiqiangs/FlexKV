@@ -1,4 +1,5 @@
 import os
+import logging
 import json
 import yaml
 from dataclasses import dataclass, field, fields, replace
@@ -114,6 +115,12 @@ class ModelConfig:
     # K/V in the content width or in additional physical head slots.
     packed_kv: bool = False
     dtype: torch.dtype = torch.bfloat16
+
+    def is_layout_mla(self) -> bool:
+        """Compatibility alias for sglang PR #31781 which calls
+        ``model_config.is_layout_mla()`` instead of ``model_config.use_mla``.
+        """
+        return self.use_mla
 
     # ------------------------------------------------------------------
     # Parallelism sizes (global, identical for every rank)
@@ -961,6 +968,44 @@ def block_size_in_bytes_for_cache(
         raise ValueError(
             "rank_info is required when model_config.layer_groups is None")
     return rank_info.token_size_in_bytes_per_pp_stage * cache_config.tokens_per_block
+
+
+def assert_mooncake_prefetch_ready(cache_config: "CacheConfig", prefetch_enabled: bool) -> None:
+    """Validate that Mooncake prefetch configuration is consistent.
+
+    Called by sglang/vLLM connectors after resolving prefetch_enabled.
+    If prefetch is enabled and Mooncake store backend is in use, verify
+    that the config path is set and readable. This is a no-op when
+    prefetch is disabled or Mooncake is not used.
+
+    Args:
+        cache_config: FlexKV CacheConfig instance.
+        prefetch_enabled: Whether any prefetch-inducing feature
+            (SSD / Remote / KV sharing) is active.
+    """
+    _logger = logging.getLogger("flexkv")
+
+    if not prefetch_enabled:
+        return
+
+    if not getattr(cache_config, "use_mooncake_store_backend", False):
+        return
+
+    config_path = getattr(cache_config, "mooncake_store_config_path", None)
+    if config_path is None:
+        _logger.warning(
+            "[FlexKV] Mooncake store backend enabled but "
+            "mooncake_store_config_path is not set. "
+            "Set FLEXKV_MOONCAKE_STORE_CONFIG_PATH or "
+            "mooncake_store_config_path in config."
+        )
+        return
+
+    if not os.path.isfile(config_path):
+        _logger.warning(
+            "[FlexKV] Mooncake store config path '%s' does not exist "
+            "or is not a file.", config_path,
+        )
 
 
 def recompute_cache_block_counts(

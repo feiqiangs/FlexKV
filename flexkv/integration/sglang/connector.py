@@ -333,11 +333,34 @@ class FlexKVConnector:
         )
         atexit.register(self.shutdown)
 
+        # Mamba / hybrid SSM state L2/L3 management.
+        self._mamba_connector = None
+        self._has_mamba = False
+        mamba_pool = getattr(kvcache, "mamba_pool", None)
+        if mamba_pool is not None:
+            try:
+                self._init_mamba_connector(mamba_pool)
+                self._has_mamba = True
+                logger.info(
+                    "[FlexKV] Mamba state L2/L3 enabled: "
+                    "layers=%d heads=%d d_v=%d d_k=%d",
+                    self._mamba_connector._config.num_linear_layers,
+                    self._mamba_connector._config.num_heads,
+                    self._mamba_connector._config.head_v_dim,
+                    self._mamba_connector._config.head_k_dim,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[FlexKV] Mamba state L2/L3 init failed: %s — "
+                    "mamba offload disabled, model still runs.", exc
+                )
+
         logger.info(
-            "[FlexKV] Connector ready %s: layerwise=%s, prefetch=%s",
+            "[FlexKV] Connector ready %s: layerwise=%s, prefetch=%s, mamba=%s",
             self._label,
             self.enable_layerwise,
             self._prefetch_enabled,
+            self._has_mamba,
         )
 
     def _new_op_context(
@@ -1480,6 +1503,8 @@ class FlexKVConnector:
         getattr(self, "_inflight_store_contexts", {}).clear()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
+        if self._mamba_connector is not None:
+            self._mamba_connector.reset()
 
     def shutdown(self) -> None:
         """Idempotent: unpin FlexKV CPU host buffers via kv_manager.shutdown()."""
@@ -1512,6 +1537,8 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] remote process shutdown: %s", exc)
             self._remote_process = None
+        if self._mamba_connector is not None:
+            self._mamba_connector.shutdown()
         logger.info("[FlexKV] connector shutdown done %s", self._label)
 
     # ------------------------------------------------------------------
@@ -2207,3 +2234,106 @@ class FlexKVConnector:
             f"[FlexKV] Failed to send eventfds to {self._layerwise_socket} "
             f"after {max_send_retries} attempts: {last_error}"
         )
+
+    # ------------------------------------------------------------------
+    # Mamba state L2/L3 API (hybrid SSM models)
+    # ------------------------------------------------------------------
+
+    def _init_mamba_connector(self, mamba_pool):
+        """Detect mamba pool shape and create MambaStateConnectorBase."""
+        from flexkv.mamba_state.connector_base import (
+            MambaStateConfig,
+            MambaStateConnectorBase,
+        )
+
+        mamba_cache = mamba_pool.mamba_cache
+        temporal = mamba_cache.temporal
+        conv_states = mamba_cache.conv if isinstance(mamba_cache.conv, (list, tuple)) else [mamba_cache.conv]
+
+        num_layers = temporal.shape[0]
+        num_heads = temporal.shape[2]
+        head_v_dim = temporal.shape[3]
+        head_k_dim = temporal.shape[4]
+
+        conv_shapes = [tuple(cs.shape[2:]) for cs in conv_states]
+        conv_dtype = conv_states[0].dtype
+        temporal_dtype = temporal.dtype
+
+        config = MambaStateConfig(
+            num_linear_layers=num_layers,
+            num_heads=num_heads,
+            head_v_dim=head_v_dim,
+            head_k_dim=head_k_dim,
+            conv_shapes=conv_shapes,
+            conv_dtype=conv_dtype,
+            temporal_dtype=temporal_dtype,
+            num_cpu_slots=int(os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "2048")),
+            enable_donate=os.environ.get("FLEXKV_MAMBA_DONATE", "0") == "1",
+            num_donate_slots=int(os.environ.get("FLEXKV_MAMBA_DONATE_SLOTS", "64")),
+        )
+
+        self._mamba_connector = MambaStateConnectorBase(config)
+        self._mamba_pool = mamba_pool
+
+    @property
+    def has_mamba(self):
+        return self._has_mamba
+
+    def store_mamba_state(self, rid, token_ids, mamba_pool_idx):
+        """Snapshot mamba state from GPU -> FlexKV L1.5(donate)/L2(int8)/L3."""
+        if not self._has_mamba or self._mamba_connector is None:
+            return
+        if mamba_pool_idx is None or mamba_pool_idx < 0:
+            return
+        try:
+            mp = self._mamba_pool
+            mc = mp.mamba_cache
+            idx = mamba_pool_idx
+            temporal = mc.temporal[:, idx, :, :, :]
+            conv = [cs[:, idx, ...] for cs in mc.conv] if isinstance(mc.conv, (list, tuple)) else [mc.conv[:, idx, ...]]
+            if self._mamba_connector._enable_donate:
+                self._mamba_connector.store_donate(token_ids, temporal, conv)
+            else:
+                self._mamba_connector.store(token_ids, temporal, conv)
+        except Exception as exc:
+            logger.warning("[FlexKV-Mamba] store_mamba_state failed: %s", exc)
+
+    def lookup_mamba_state(self, token_ids, rid=None):
+        """Check if mamba state exists in FlexKV L2/L3. Returns matched token count."""
+        if not self._has_mamba or self._mamba_connector is None:
+            return 0
+        try:
+            hit, matched_tokens = self._mamba_connector.lookup(token_ids)
+            return matched_tokens if hit else 0
+        except Exception as exc:
+            logger.debug("[FlexKV-Mamba] lookup_mamba_state: %s", exc)
+            return 0
+
+    def retrieve_mamba_state(self, token_ids, mamba_pool_idx):
+        """Load mamba state from FlexKV L2/L3 -> GPU (CoW)."""
+        if not self._has_mamba or self._mamba_connector is None:
+            return False
+        if mamba_pool_idx is None or mamba_pool_idx < 0:
+            return False
+        try:
+            result = self._mamba_connector.retrieve(token_ids)
+            if result is None:
+                return False
+            temporal_src, conv_src = result
+            mp = self._mamba_pool
+            idx = mamba_pool_idx
+            mp.temporal[:, idx, :, :, :].copy_(temporal_src, non_blocking=True)
+            if isinstance(mp.conv, (list, tuple)):
+                for i, cs in enumerate(mp.conv):
+                    cs[:, idx, ...].copy_(conv_src[i], non_blocking=True)
+            else:
+                mp.conv[:, idx, ...].copy_(conv_src[0], non_blocking=True)
+            return True
+        except Exception as exc:
+            logger.warning("[FlexKV-Mamba] retrieve_mamba_state failed: %s", exc)
+            return False
+
+    def get_mamba_stats(self):
+        if self._mamba_connector is None:
+            return {}
+        return self._mamba_connector.get_stats()

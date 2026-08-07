@@ -730,10 +730,30 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         elif ref_blocks_len == ref_num_layers * 2:
             self.gpu_block_type_ = 2
         else:
-            raise ValueError(
-                f"Invalid GPU block type: ref_blocks_len={ref_blocks_len}, "
-                f"ref_num_layers={ref_num_layers}"
-            )
+            # num_layers doesn't match block count. This happens for hybrid
+            # SSM models (Qwen3.5/Kimi K3) where model_config.num_layers
+            # includes non-KV layers (GDN/KDA) but only full-attention layers
+            # have token KV. Infer type from block count parity:
+            # P1-1: Use is_mla from config (not parity heuristic)
+            is_mla = getattr(self, 'is_mla', False)
+            if is_mla:
+                self.gpu_block_type_ = 0
+                if ref_num_layers != ref_blocks_len:
+                    self.num_layers = ref_blocks_len
+                    flexkv_logger.info(
+                        "gpu_block_type=0 (MLA) from is_mla flag, "
+                        "num_layers %d -> %d (hybrid SSM)",
+                        ref_num_layers, self.num_layers,
+                    )
+            else:
+                self.gpu_block_type_ = 2
+                if ref_num_layers != ref_blocks_len // 2:
+                    self.num_layers = ref_blocks_len // 2
+                    flexkv_logger.info(
+                        "gpu_block_type=2 (GQA) from is_mla=False, "
+                        "num_layers %d -> %d (hybrid SSM)",
+                        ref_num_layers, self.num_layers,
+                    )
 
         self.transfer_stream = torch.cuda.Stream()
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
