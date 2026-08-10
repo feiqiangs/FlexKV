@@ -125,6 +125,11 @@ class MambaStateConnectorBase:
         self._max_donate_slots = config.num_donate_slots
         self._donate_hit_count: Dict[str, int] = {}
 
+        # L1.8: CPU bf16 host pool (intermediate tier, no quantization)
+        # GPU donate → host bf16 → CPU int8 (progressive demotion)
+        self._host_cache: OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._max_host_slots = config.num_donate_slots * 4  # host is cheaper than GPU
+
         # Write policy
         self._write_policy = config.write_policy
         self._write_through_threshold = config.write_through_threshold
@@ -323,14 +328,32 @@ class MambaStateConnectorBase:
         return prefix_hash
 
     def _evict_donated(self) -> None:
-        """Demote the LRU donated slot to CPU int8 (or drop if pool full)."""
+        """Demote the LRU donated slot to host bf16 cache (intermediate tier)."""
         if not self._donated_slots:
             return
 
         prefix_hash, (temporal_gpu, conv_gpu) = next(iter(self._donated_slots))
         del self._donated_slots[prefix_hash]
+        self._donate_hit_count.pop(prefix_hash, None)
 
-        # Demote: D2H + int8 quantize → CPU pool
+        # Demote to host bf16 (D2H, no quantization)
+        temporal_cpu = temporal_gpu.detach().to("cpu", non_blocking=False)
+        conv_cpu = conv_gpu.detach().to("cpu", non_blocking=False)
+
+        if len(self._host_cache) >= self._max_host_slots:
+            self._evict_host()
+
+        self._host_cache[prefix_hash] = (temporal_cpu, conv_cpu)
+        logger.debug("[FlexKV-Mamba] demoted donate→host: prefix=%s...", prefix_hash[:12])
+
+    def _evict_host(self) -> None:
+        """Demote the LRU host bf16 slot to CPU int8 (quantize + compress)."""
+        if not self._host_cache:
+            return
+
+        prefix_hash, (temporal_cpu, conv_cpu) = next(iter(self._host_cache))
+        del self._host_cache[prefix_hash]
+
         ckpt_slot = self._ckpt_pool.allocate()
         if ckpt_slot is None:
             evicted = self._evict_lru()
@@ -338,32 +361,24 @@ class MambaStateConnectorBase:
                 ckpt_slot = self._ckpt_pool.allocate()
 
         if ckpt_slot is not None:
-            temporal_cpu = temporal_gpu.detach().to("cpu", non_blocking=False)
-            conv_cpu = conv_gpu.detach().to("cpu", non_blocking=False)
             self._ckpt_pool.store_from_active(ckpt_slot, temporal_cpu, conv_cpu)
             self._prefix_map[prefix_hash] = ckpt_slot
             self._slot_to_prefix[ckpt_slot] = prefix_hash
-            logger.debug("[FlexKV-Mamba] demoted donate→int8: prefix=%s...", prefix_hash[:12])
+            logger.debug("[FlexKV-Mamba] demoted host→int8: prefix=%s...", prefix_hash[:12])
         else:
-            logger.debug("[FlexKV-Mamba] dropped donate (pool full): prefix=%s...", prefix_hash[:12])
+            logger.debug("[FlexKV-Mamba] dropped host (pool full): prefix=%s...", prefix_hash[:12])
 
     def _write_through_demote(self, prefix_hash: str) -> None:
-        """Write-through: proactively create CPU int8 copy while keeping GPU donate slot."""
-        if prefix_hash not in self._donated_slots or prefix_hash in self._prefix_map:
+        """Write-through: proactively create host bf16 copy while keeping GPU donate slot."""
+        if prefix_hash not in self._donated_slots or prefix_hash in self._host_cache:
             return
         temporal_gpu, conv_gpu = self._donated_slots[prefix_hash]
-        ckpt_slot = self._ckpt_pool.allocate()
-        if ckpt_slot is None:
-            evicted = self._evict_lru()
-            if evicted is not None:
-                ckpt_slot = self._ckpt_pool.allocate()
-        if ckpt_slot is not None:
-            temporal_cpu = temporal_gpu.detach().to("cpu", non_blocking=False)
-            conv_cpu = conv_gpu.detach().to("cpu", non_blocking=False)
-            self._ckpt_pool.store_from_active(ckpt_slot, temporal_cpu, conv_cpu)
-            self._prefix_map[prefix_hash] = ckpt_slot
-            self._slot_to_prefix[ckpt_slot] = prefix_hash
-            logger.debug("[FlexKV-Mamba] write-through demote: prefix=%s...", prefix_hash[:12])
+        temporal_cpu = temporal_gpu.detach().to("cpu", non_blocking=False)
+        conv_cpu = conv_gpu.detach().to("cpu", non_blocking=False)
+        if len(self._host_cache) >= self._max_host_slots:
+            self._evict_host()
+        self._host_cache[prefix_hash] = (temporal_cpu, conv_cpu)
+        logger.debug("[FlexKV-Mamba] write-through demote→host: prefix=%s...", prefix_hash[:12])
 
     # ------------------------------------------------------------------
     # Lookup: check if mamba state exists for a prefix
@@ -388,6 +403,10 @@ class MambaStateConnectorBase:
             if prefix_hash in self._donated_slots:
                 self._hit_count += 1
                 self._donated_slots.move_to_end(prefix_hash)
+                return True, len(token_ids)
+            if prefix_hash in self._host_cache:
+                self._hit_count += 1
+                self._host_cache.move_to_end(prefix_hash)
                 return True, len(token_ids)
             if prefix_hash in self._prefix_map:
                 self._hit_count += 1
@@ -469,6 +488,19 @@ class MambaStateConnectorBase:
                 )
                 return prefix_hash, temporal, [conv]
 
+            if prefix_hash in self._host_cache:
+                temporal, conv = self._host_cache[prefix_hash]
+                self._host_cache.move_to_end(prefix_hash)
+                self._hit_count += 1
+                self._acquire_ref(prefix_hash)
+                return prefix_hash, temporal, [conv]
+
+            if prefix_hash in self._host_cache:
+                temporal, conv = self._host_cache[prefix_hash]
+                self._host_cache.move_to_end(prefix_hash)
+                self._hit_count += 1
+                return prefix_hash, temporal, [conv]
+
             if prefix_hash in self._prefix_map:
                 ckpt_slot = self._prefix_map[prefix_hash]
                 self._prefix_map.move_to_end(prefix_hash)
@@ -497,6 +529,19 @@ class MambaStateConnectorBase:
                         "[FlexKV-Mamba] retrieve(donate): prefix=%s... matched=%d",
                         prefix_hash[:12], end,
                     )
+                    return prefix_hash, temporal, [conv]
+
+                if prefix_hash in self._host_cache:
+                    temporal, conv = self._host_cache[prefix_hash]
+                    self._host_cache.move_to_end(prefix_hash)
+                    self._hit_count += 1
+                    self._acquire_ref(prefix_hash)
+                    return prefix_hash, temporal, [conv]
+
+                if prefix_hash in self._host_cache:
+                    temporal, conv = self._host_cache[prefix_hash]
+                    self._host_cache.move_to_end(prefix_hash)
+                    self._hit_count += 1
                     return prefix_hash, temporal, [conv]
 
                 if prefix_hash in self._prefix_map:
@@ -621,6 +666,7 @@ class MambaStateConnectorBase:
         with self._lock:
             self._donated_slots.clear()
             self._donate_hit_count.clear()
+            self._host_cache.clear()
             self._prefix_map.clear()
             self._slot_to_prefix.clear()
             self._prefix_lengths.clear()
