@@ -70,6 +70,11 @@ class MambaStateConfig:
     # int8 compression
     enable_int8_compress: bool = True
 
+    # Write policy: "write_back" (default, store on eviction) or
+    # "write_through" (proactively D2H+int8 after N hits).
+    write_policy: str = "write_back"
+    write_through_threshold: int = 2  # hit count to trigger proactive backup
+
     # Donate: GPU-side bf16 checkpoint tier (no D2H, no int8).
     # Stores a GPU clone of the active state as a hot cache layer above
     # the CPU int8 pool. Retrieve hits donate first (GPU→GPU copy),
@@ -117,6 +122,11 @@ class MambaStateConnectorBase:
         self._enable_donate = config.enable_donate
         self._donated_slots: OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
         self._max_donate_slots = config.num_donate_slots
+        self._donate_hit_count: Dict[str, int] = {}
+
+        # Write policy
+        self._write_policy = config.write_policy
+        self._write_through_threshold = config.write_through_threshold
 
         # Prefix hash → checkpoint slot mapping (LRU ordered)
         self._prefix_map: OrderedDict[str, int] = OrderedDict()
@@ -331,6 +341,24 @@ class MambaStateConnectorBase:
         else:
             logger.debug("[FlexKV-Mamba] dropped donate (pool full): prefix=%s...", prefix_hash[:12])
 
+    def _write_through_demote(self, prefix_hash: str) -> None:
+        """Write-through: proactively create CPU int8 copy while keeping GPU donate slot."""
+        if prefix_hash not in self._donated_slots or prefix_hash in self._prefix_map:
+            return
+        temporal_gpu, conv_gpu = self._donated_slots[prefix_hash]
+        ckpt_slot = self._ckpt_pool.allocate()
+        if ckpt_slot is None:
+            evicted = self._evict_lru()
+            if evicted is not None:
+                ckpt_slot = self._ckpt_pool.allocate()
+        if ckpt_slot is not None:
+            temporal_cpu = temporal_gpu.detach().to("cpu", non_blocking=False)
+            conv_cpu = conv_gpu.detach().to("cpu", non_blocking=False)
+            self._ckpt_pool.store_from_active(ckpt_slot, temporal_cpu, conv_cpu)
+            self._prefix_map[prefix_hash] = ckpt_slot
+            self._slot_to_prefix[ckpt_slot] = prefix_hash
+            logger.debug("[FlexKV-Mamba] write-through demote: prefix=%s...", prefix_hash[:12])
+
     # ------------------------------------------------------------------
     # Lookup: check if mamba state exists for a prefix
     # ------------------------------------------------------------------
@@ -411,6 +439,13 @@ class MambaStateConnectorBase:
                 self._donated_slots.move_to_end(prefix_hash)
                 self._hit_count += 1
                 self._acquire_ref(prefix_hash)
+                # write_through: proactively demote to CPU int8 after N hits
+                if (self._write_policy == "write_through"
+                        and prefix_hash not in self._prefix_map):
+                    cnt = self._donate_hit_count.get(prefix_hash, 0) + 1
+                    self._donate_hit_count[prefix_hash] = cnt
+                    if cnt >= self._write_through_threshold:
+                        self._write_through_demote(prefix_hash)
                 logger.debug(
                     "[FlexKV-Mamba] retrieve(donate): prefix=%s... matched=%d",
                     prefix_hash[:12], len(token_ids),
@@ -568,6 +603,7 @@ class MambaStateConnectorBase:
             time.sleep(0.1)
         with self._lock:
             self._donated_slots.clear()
+            self._donate_hit_count.clear()
             self._prefix_map.clear()
             self._slot_to_prefix.clear()
             self._prefix_lengths.clear()

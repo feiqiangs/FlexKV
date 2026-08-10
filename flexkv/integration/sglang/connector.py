@@ -2270,6 +2270,8 @@ class FlexKVConnector:
             num_cpu_slots=int(os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "2048")),
             enable_donate=os.environ.get("FLEXKV_MAMBA_DONATE", "0") == "1",
             num_donate_slots=int(os.environ.get("FLEXKV_MAMBA_DONATE_SLOTS", "64")),
+            write_policy=os.environ.get("FLEXKV_MAMBA_WRITE_POLICY", "write_back"),
+            write_through_threshold=int(os.environ.get("FLEXKV_MAMBA_WRITE_THROUGH_THRESHOLD", "2")),
         )
 
         self._mamba_connector = MambaStateConnectorBase(config)
