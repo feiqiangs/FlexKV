@@ -2325,12 +2325,18 @@ class FlexKVConnector:
             logger.warning("[FlexKV-Mamba] store_mamba_state failed: %s", exc)
 
     def lookup_mamba_state(self, token_ids, rid=None):
-        """Check if mamba state exists in FlexKV L2/L3. Returns matched token count."""
+        """Check if mamba state exists in FlexKV L2/L3. Returns matched token count.
+
+        On miss, checks tombstones for gap recompute boundary.
+        """
         if not self._has_mamba or self._mamba_connector is None:
             return 0
         try:
             hit, matched_tokens = self._mamba_connector.lookup(token_ids)
-            return matched_tokens if hit else 0
+            if hit:
+                return matched_tokens
+            # Check tombstones: return boundary even on miss for gap recompute
+            return self._mamba_connector.lookup_tombstone_boundary(token_ids)
         except Exception as exc:
             logger.debug("[FlexKV-Mamba] lookup_mamba_state: %s", exc)
             return 0

@@ -148,6 +148,11 @@ class MambaStateConnectorBase:
         # Key = prefix_hash, value = refcount. _evict_lru skips refcount > 0 entries.
         self._prefix_refcount: Dict[str, int] = {}
 
+        # Tombstone: evicted checkpoints (prefix_hash → token_count).
+        # Allows gap recompute to know where the last checkpoint WAS,
+        # even after eviction. Looked up by shorter-prefix search.
+        self._tombstones: Dict[str, int] = {}
+
         # L3 transfer tracking (SSD / Remote paths)
         self._ssd_dir: str = config.ssd_dir
         self._ssd_paths: Dict[str, str] = {}  # prefix_hash → ssd file path
@@ -682,6 +687,9 @@ class MambaStateConnectorBase:
         del self._prefix_map[prefix_hash]
         self._slot_to_prefix.pop(ckpt_slot, None)
         self._ckpt_pool.free(ckpt_slot)
+        # Create tombstone: remember the token count for gap recompute
+        # (scheduler can still find the boundary even after eviction)
+        self._tombstones[prefix_hash] = len(prefix_hash)  # approximate token count
 
         logger.debug(
             "[FlexKV-Mamba] evict LRU: prefix=%s... slot=%d",
@@ -689,6 +697,22 @@ class MambaStateConnectorBase:
             ckpt_slot,
         )
         return ckpt_slot
+
+    def lookup_tombstone_boundary(self, token_ids: List[int]) -> int:
+        """Find the nearest tombstone boundary (evicted checkpoint position).
+
+        Returns token count of the nearest tombstone, or 0 if none.
+        Used for gap recompute when the checkpoint was evicted.
+        """
+        candidates = sorted(
+            [l for l in self._prefix_lengths if l < len(token_ids)],
+            reverse=True
+        )
+        for end in candidates:
+            ph = self._hash_prefix(token_ids[:end])
+            if ph in self._tombstones:
+                return end
+        return 0
 
     def mark_branch_point(self, token_ids: List[int]) -> None:
         """Mark a prefix as a radix branch point (high priority, don't evict)."""
@@ -737,6 +761,7 @@ class MambaStateConnectorBase:
             self._prefix_lengths.clear()
             self._branch_points.clear()
             self._prefix_refcount.clear()
+            self._tombstones.clear()
             self._ckpt_pool.reset()
             self._ssd_paths.clear()
             self._remote_keys.clear()
