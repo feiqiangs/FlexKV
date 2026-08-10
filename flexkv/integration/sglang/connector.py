@@ -2259,6 +2259,18 @@ class FlexKVConnector:
         conv_dtype = conv_states[0].dtype
         temporal_dtype = temporal.dtype
 
+        # Capacity: if FLEXKV_MAMBA_CPU_SLOTS is set, use it directly.
+        # Otherwise derive from device pool size × ratio (aligned with
+        # sglang --hicache-ratio). int8 compression gives 2x, so
+        # cpu_slots = device_slots × ratio × 2.
+        cpu_slots_env = os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "0")
+        if int(cpu_slots_env) > 0:
+            num_cpu_slots = int(cpu_slots_env)
+        else:
+            ratio = float(os.environ.get("FLEXKV_MAMBA_HICACHE_RATIO", "2.0"))
+            device_slots = getattr(mamba_pool, "size", 256)
+            num_cpu_slots = int(device_slots * ratio * 2)  # 2x for int8
+
         config = MambaStateConfig(
             num_linear_layers=num_layers,
             num_heads=num_heads,
@@ -2267,7 +2279,7 @@ class FlexKVConnector:
             conv_shapes=conv_shapes,
             conv_dtype=conv_dtype,
             temporal_dtype=temporal_dtype,
-            num_cpu_slots=int(os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "2048")),
+            num_cpu_slots=num_cpu_slots,
             enable_donate=os.environ.get("FLEXKV_MAMBA_DONATE", "0") == "1",
             num_donate_slots=int(os.environ.get("FLEXKV_MAMBA_DONATE_SLOTS", "64")),
             write_policy=os.environ.get("FLEXKV_MAMBA_WRITE_POLICY", "write_back"),
