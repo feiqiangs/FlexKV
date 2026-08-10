@@ -154,6 +154,11 @@ class MambaStateConnectorBase:
         self._hit_count = 0
         self._retrieve_count = 0
 
+        # Prefetch: early retrieve on background thread
+        self._prefetch_results: Dict[str, Any] = {}
+        self._prefetch_threads: Dict[str, Any] = {}
+        self._prefetch_lock = threading.Lock()
+
         logger.info(
             "[FlexKV-Mamba] MambaStateConnectorBase initialized: "
             "layers=%d heads=%d d_v=%d d_k=%d cpu_slots=%d int8=%s",
@@ -432,6 +437,17 @@ class MambaStateConnectorBase:
         with self._lock:
             self._retrieve_count += 1
 
+        # Check prefetch cache first (early retrieve may have completed)
+        prefix_hash = self._hash_prefix(token_ids)
+        with self._prefetch_lock:
+            if prefix_hash in self._prefetch_results:
+                result = self._prefetch_results.pop(prefix_hash)
+                self._prefetch_threads.pop(prefix_hash, None)
+                if result is not None:
+                    self._acquire_ref(result[0])
+                    return result
+                return None
+
         # Check donate tier first (GPU bf16, zero-D2H), then CPU int8
         prefix_hash = self._hash_prefix(token_ids)
         with self._lock:
@@ -613,24 +629,82 @@ class MambaStateConnectorBase:
             self._ckpt_pool.reset()
             self._ssd_paths.clear()
             self._remote_keys.clear()
+            with self._prefetch_lock:
+                self._prefetch_results.clear()
+                self._prefetch_threads.clear()
 
-    # --- P2-3: Prefetch support (stubs for L3 SSD/Remote) ---
+    # --- P2-1: Prefetch support (early retrieve for overlap) ---
 
     def prefetch_mamba_state(self, token_ids: List[int]) -> bool:
-        """Prefetch mamba state from L3 (SSD/Remote) to L2 (CPU).
+        """Prefetch mamba state: start retrieve on background thread.
 
-        Returns True if prefetch was initiated, False if not available.
-        Currently a stub — L3 transfer not yet implemented.
+        Kicks off the hash + dict lookup + dequant early (during match_prefix),
+        so init_load_back's retrieve returns the cached result immediately.
+        Returns True if prefetch was initiated, False if miss.
         """
-        # TODO: implement L3 prefetch via FlexKV transfer engine
-        return False
+        import threading
+        prefix_hash = self._hash_prefix(token_ids)
+        with self._lock:
+            if prefix_hash not in self._prefix_map and prefix_hash not in self._donated_slots:
+                return False
+            if prefix_hash in self._prefetch_results:
+                return True  # already prefetched
+
+        def _do_prefetch():
+            result = self._retrieve_internal(token_ids)
+            with self._prefetch_lock:
+                self._prefetch_results[prefix_hash] = result
+
+        t = threading.Thread(target=_do_prefetch, daemon=True)
+        with self._prefetch_lock:
+            self._prefetch_threads[prefix_hash] = t
+        t.start()
+        return True
+
+    def _retrieve_internal(self, token_ids: List[int]):
+        """Internal retrieve without acquiring ref (prefetch uses this)."""
+        with self._lock:
+            self._retrieve_count += 1
+        prefix_hash = self._hash_prefix(token_ids)
+        with self._lock:
+            if prefix_hash in self._donated_slots:
+                temporal, conv = self._donated_slots[prefix_hash]
+                self._donated_slots.move_to_end(prefix_hash)
+                self._hit_count += 1
+                return prefix_hash, temporal, [conv]
+            if prefix_hash in self._prefix_map:
+                ckpt_slot = self._prefix_map[prefix_hash]
+                self._prefix_map.move_to_end(prefix_hash)
+                temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
+                return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
+        candidates = sorted([l for l in self._prefix_lengths if l < len(token_ids)], reverse=True)
+        for end in candidates:
+            prefix_hash = self._hash_prefix(token_ids[:end])
+            with self._lock:
+                if prefix_hash in self._donated_slots:
+                    temporal, conv = self._donated_slots[prefix_hash]
+                    self._donated_slots.move_to_end(prefix_hash)
+                    self._hit_count += 1
+                    return prefix_hash, temporal, [conv]
+                if prefix_hash in self._prefix_map:
+                    ckpt_slot = self._prefix_map[prefix_hash]
+                    self._prefix_map.move_to_end(prefix_hash)
+                    temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
+                    return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
+        return None
 
     def check_prefetch_progress(self, token_ids: List[int]) -> bool:
         """Check if prefetch has completed. Returns True if ready."""
-        return True  # stub — no async prefetch yet
+        prefix_hash = self._hash_prefix(token_ids)
+        with self._prefetch_lock:
+            return prefix_hash in self._prefetch_results
 
     def cancel_prefetch(self, token_ids: List[int]) -> None:
         """Cancel an in-flight prefetch."""
+        prefix_hash = self._hash_prefix(token_ids)
+        with self._prefetch_lock:
+            self._prefetch_results.pop(prefix_hash, None)
+            self._prefetch_threads.pop(prefix_hash, None)
         pass  # stub
 
     def evict_by_prefix(self, token_ids: List[int]) -> bool:
