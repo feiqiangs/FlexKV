@@ -22,6 +22,7 @@ class MambaStatePoolConfig:
     head_v_dim: int = 0
     head_k_dim: int = 0
     conv_shape: Tuple[int, ...] = ()
+    conv_shapes: List[Tuple[int, ...]] = ()  # multi-conv-type: list of shapes per conv type
     conv_shard_groups: Optional[List[int]] = None
     is_kda: bool = False
 

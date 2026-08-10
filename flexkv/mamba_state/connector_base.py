@@ -110,6 +110,7 @@ class MambaStateConnectorBase:
             head_v_dim=config.head_v_dim,
             head_k_dim=config.head_k_dim,
             conv_shape=config.conv_shapes[0] if config.conv_shapes else (),
+            conv_shapes=config.conv_shapes,
             # P1-4: only single conv type supported (all known models have 1)
             # If future models have multiple conv types, pool needs per-type buffers
             num_cpu_slots=config.num_cpu_slots,
