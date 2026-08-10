@@ -125,6 +125,10 @@ class MambaStateConnectorBase:
         self._branch_points: set = set()  # radix_branch: high-priority prefixes (don't evict)
         self._lock = threading.Lock()
 
+        # Lock reference: prevent evicting checkpoints that active retrieves hold.
+        # Key = prefix_hash, value = refcount. _evict_lru skips refcount > 0 entries.
+        self._prefix_refcount: Dict[str, int] = {}
+
         # L3 transfer tracking (SSD / Remote paths)
         self._ssd_paths: Dict[str, str] = {}  # prefix_hash → ssd file path
         self._remote_keys: Dict[str, str] = {}  # prefix_hash → remote key
@@ -385,17 +389,16 @@ class MambaStateConnectorBase:
     def retrieve(
         self,
         token_ids: List[int],
-    ) -> Optional[Tuple[torch.Tensor, List[torch.Tensor]]]:
+    ) -> Optional[Tuple[str, torch.Tensor, List[torch.Tensor]]]:
         """Retrieve mamba state from FlexKV L1.5/L2/L3.
 
         Returns:
-            (temporal_state, conv_state) if found, None if miss.
+            (prefix_hash, temporal_state, conv_state) if found, None if miss.
             Tensors may be on GPU (donate hit, bf16) or CPU (int8 pool,
             dequantized to bf16). The connector copies to the active slot.
 
-        Note: This is a CoW-friendly read — the stored checkpoint is
-        not modified. The connector writes the state to a new GPU slot
-        (framework's CoW mechanism).
+        The caller MUST call release_retrieve(prefix_hash) after the GPU
+        copy completes, to allow eviction of this checkpoint.
         """
         with self._lock:
             self._retrieve_count += 1
@@ -407,21 +410,23 @@ class MambaStateConnectorBase:
                 temporal, conv = self._donated_slots[prefix_hash]
                 self._donated_slots.move_to_end(prefix_hash)
                 self._hit_count += 1
+                self._acquire_ref(prefix_hash)
                 logger.debug(
                     "[FlexKV-Mamba] retrieve(donate): prefix=%s... matched=%d",
                     prefix_hash[:12], len(token_ids),
                 )
-                return temporal, [conv]
+                return prefix_hash, temporal, [conv]
 
             if prefix_hash in self._prefix_map:
                 ckpt_slot = self._prefix_map[prefix_hash]
                 self._prefix_map.move_to_end(prefix_hash)
+                self._acquire_ref(prefix_hash)
                 temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
                 logger.debug(
                     "[FlexKV-Mamba] retrieve: prefix=%s... slot=%d matched_tokens=%d",
                     prefix_hash[:12], ckpt_slot, len(token_ids),
                 )
-                return temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
+                return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
 
         candidates = sorted(
             [l for l in self._prefix_lengths if l < len(token_ids)],
@@ -435,24 +440,47 @@ class MambaStateConnectorBase:
                     temporal, conv = self._donated_slots[prefix_hash]
                     self._donated_slots.move_to_end(prefix_hash)
                     self._hit_count += 1
+                    self._acquire_ref(prefix_hash)
                     logger.debug(
                         "[FlexKV-Mamba] retrieve(donate): prefix=%s... matched=%d",
                         prefix_hash[:12], end,
                     )
-                    return temporal, [conv]
+                    return prefix_hash, temporal, [conv]
 
                 if prefix_hash in self._prefix_map:
                     ckpt_slot = self._prefix_map[prefix_hash]
                     self._prefix_map.move_to_end(prefix_hash)
+                    self._acquire_ref(prefix_hash)
                     temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
                     logger.debug(
                         "[FlexKV-Mamba] retrieve: prefix=%s... slot=%d matched_tokens=%d",
                         prefix_hash[:12], ckpt_slot, end,
                     )
-                    return temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
+                    return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
 
         logger.debug("[FlexKV-Mamba] retrieve: miss (no matching prefix)")
         return None
+
+    # ------------------------------------------------------------------
+    # Lock reference: prevent evicting checkpoints in active use
+    # ------------------------------------------------------------------
+
+    def _acquire_ref(self, prefix_hash: str) -> None:
+        """Increment refcount for a prefix (called before retrieve reads slot)."""
+        self._prefix_refcount[prefix_hash] = self._prefix_refcount.get(prefix_hash, 0) + 1
+
+    def _release_ref(self, prefix_hash: str) -> None:
+        """Decrement refcount for a prefix (called after copy to GPU completes)."""
+        cnt = self._prefix_refcount.get(prefix_hash, 0)
+        if cnt <= 1:
+            self._prefix_refcount.pop(prefix_hash, None)
+        else:
+            self._prefix_refcount[prefix_hash] = cnt - 1
+
+    def release_retrieve(self, prefix_hash: str) -> None:
+        """Release a retrieve reference. Call after GPU copy completes."""
+        with self._lock:
+            self._release_ref(prefix_hash)
 
     # ------------------------------------------------------------------
     # Eviction
@@ -461,27 +489,35 @@ class MambaStateConnectorBase:
     def _evict_lru(self) -> Optional[int]:
         """Evict the least recently used checkpoint slot.
 
-        radix_branch: skip entries marked as branch points (high priority),
-        evict the least recently used non-branch-point entry instead.
+        Skips entries with refcount > 0 (active retrieve in flight).
+        Skips branch points (high priority) unless all are locked.
         """
         if not self._prefix_map:
             return None
 
-        # Find first non-branch-point entry (LRU order)
+        # Find first evictable entry: non-branch-point AND refcount == 0
         prefix_hash = None
         ckpt_slot = None
+        fallback = None  # branch-point but unlocked — last resort
         for ph, slot in self._prefix_map.items():
-            if ph not in self._branch_points:
-                prefix_hash = ph
-                ckpt_slot = slot
-                break
+            if self._prefix_refcount.get(ph, 0) > 0:
+                continue  # locked by active retrieve
+            if ph in self._branch_points:
+                if fallback is None:
+                    fallback = (ph, slot)
+                continue
+            prefix_hash = ph
+            ckpt_slot = slot
+            break
 
         if prefix_hash is None:
-            # All remaining are branch points — evict the LRU one anyway
-            prefix_hash, ckpt_slot = self._prefix_map.popitem(last=False)
-        else:
-            del self._prefix_map[prefix_hash]
+            if fallback is not None:
+                prefix_hash, ckpt_slot = fallback
+            else:
+                logger.debug("[FlexKV-Mamba] evict LRU: no evictable slots (all locked or branch points)")
+                return None
 
+        del self._prefix_map[prefix_hash]
         self._slot_to_prefix.pop(ckpt_slot, None)
         self._ckpt_pool.free(ckpt_slot)
 
@@ -536,6 +572,7 @@ class MambaStateConnectorBase:
             self._slot_to_prefix.clear()
             self._prefix_lengths.clear()
             self._branch_points.clear()
+            self._prefix_refcount.clear()
             self._ckpt_pool.reset()
             self._ssd_paths.clear()
             self._remote_keys.clear()

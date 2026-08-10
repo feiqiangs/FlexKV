@@ -2319,7 +2319,7 @@ class FlexKVConnector:
             result = self._mamba_connector.retrieve(token_ids)
             if result is None:
                 return False
-            temporal_src, conv_src = result
+            prefix_hash, temporal_src, conv_src = result
             mp = self._mamba_pool
             idx = mamba_pool_idx
             mp.temporal[:, idx, :, :, :].copy_(temporal_src, non_blocking=True)
@@ -2328,6 +2328,7 @@ class FlexKVConnector:
                     cs[:, idx, ...].copy_(conv_src[i], non_blocking=True)
             else:
                 mp.conv[:, idx, ...].copy_(conv_src[0], non_blocking=True)
+            self._mamba_connector.release_retrieve(prefix_hash)
             return True
         except Exception as exc:
             logger.warning("[FlexKV-Mamba] retrieve_mamba_state failed: %s", exc)
