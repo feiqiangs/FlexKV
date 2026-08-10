@@ -2423,3 +2423,52 @@ class FlexKVConnector:
         except Exception as exc:
             logger.warning("[FlexKV-Mamba] load_mamba_cpu_copy failed: %s", exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Spec decoding: save / restore intermediate mamba state
+    # ------------------------------------------------------------------
+
+    def save_mamba_spec_state(self, mamba_pool_idx):
+        """Save mamba state for speculative decoding rollback (GPU clone)."""
+        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
+            return False
+        try:
+            mp = self._mamba_pool
+            mc = mp.mamba_cache
+            idx = mamba_pool_idx
+            self._mamba_spec_backup = (
+                mc.temporal[:, idx, :, :, :].clone(),
+                [cs[:, idx, ...].clone() for cs in mc.conv] if isinstance(mc.conv, (list, tuple))
+                else [mc.conv[:, idx, ...].clone()],
+            )
+            return True
+        except Exception as exc:
+            logger.debug("[FlexKV-Mamba] save_mamba_spec_state: %s", exc)
+            return False
+
+    def restore_mamba_spec_state(self, mamba_pool_idx):
+        """Restore mamba state from spec backup (rollback on draft rejection)."""
+        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
+            return False
+        backup = getattr(self, "_mamba_spec_backup", None)
+        if backup is None:
+            return False
+        try:
+            temporal_bak, conv_bak = backup
+            mp = self._mamba_pool
+            mc = mp.mamba_cache
+            idx = mamba_pool_idx
+            mc.temporal[:, idx, :, :, :].copy_(temporal_bak)
+            if isinstance(mc.conv, (list, tuple)):
+                for i, cs in enumerate(mc.conv):
+                    cs[:, idx, ...].copy_(conv_bak[i])
+            else:
+                mc.conv[:, idx, ...].copy_(conv_bak[0])
+            return True
+        except Exception as exc:
+            logger.debug("[FlexKV-Mamba] restore_mamba_spec_state: %s", exc)
+            return False
+
+    def clear_mamba_spec_state(self):
+        """Clear spec backup (free GPU memory)."""
+        self._mamba_spec_backup = None
