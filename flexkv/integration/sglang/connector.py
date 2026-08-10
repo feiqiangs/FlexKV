@@ -2368,3 +2368,58 @@ class FlexKVConnector:
         if self._mamba_connector is None:
             return {}
         return self._mamba_connector.get_stats()
+
+    # ------------------------------------------------------------------
+    # PD disaggregation: mamba state cross-instance transfer
+    # ------------------------------------------------------------------
+
+    def get_mamba_cpu_copy(self, mamba_pool_idx):
+        """Serialize GPU mamba state to CPU tensors for PD transfer.
+
+        Returns (temporal_cpu, conv_cpu_list) or None if no mamba.
+        """
+        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
+            return None
+        try:
+            mp = self._mamba_pool
+            mc = mp.mamba_cache
+            idx = mamba_pool_idx
+            temporal_cpu = mc.temporal[:, idx, :, :, :].detach().to("cpu", non_blocking=False)
+            if isinstance(mc.conv, (list, tuple)):
+                conv_cpu = [cs[:, idx, ...].detach().to("cpu", non_blocking=False) for cs in mc.conv]
+            else:
+                conv_cpu = [mc.conv[:, idx, ...].detach().to("cpu", non_blocking=False)]
+            return temporal_cpu, conv_cpu
+        except Exception as exc:
+            logger.warning("[FlexKV-Mamba] get_mamba_cpu_copy failed: %s", exc)
+            return None
+
+    def load_mamba_cpu_copy(self, mamba_pool_idx, cpu_tensors):
+        """Restore CPU tensors to GPU mamba slot (decode side of PD).
+
+        Args:
+            mamba_pool_idx: target GPU slot index
+            cpu_tensors: (temporal_cpu, conv_cpu_list) from get_mamba_cpu_copy
+        """
+        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
+            return False
+        if cpu_tensors is None:
+            return False
+        try:
+            temporal_cpu, conv_cpu = cpu_tensors
+            mp = self._mamba_pool
+            idx = mamba_pool_idx
+            mp.temporal[:, idx, :, :, :].copy_(temporal_cpu, non_blocking=True)
+            if isinstance(mp.conv, (list, tuple)):
+                for i, cs in enumerate(mp.conv):
+                    cs[:, idx, ...].copy_(conv_cpu[i], non_blocking=True)
+            else:
+                mp.conv[:, idx, ...].copy_(conv_cpu[0], non_blocking=True)
+            # Reset ReplaySSM write_pos (restored state is at a flush boundary)
+            write_pos_buf = getattr(mp, "replayssm_write_pos", None)
+            if write_pos_buf is not None and idx < len(write_pos_buf):
+                write_pos_buf[idx].fill_(0)
+            return True
+        except Exception as exc:
+            logger.warning("[FlexKV-Mamba] load_mamba_cpu_copy failed: %s", exc)
+            return False
