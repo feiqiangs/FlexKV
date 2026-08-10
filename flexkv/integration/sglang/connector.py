@@ -2303,6 +2303,17 @@ class FlexKVConnector:
             mp = self._mamba_pool
             mc = mp.mamba_cache
             idx = mamba_pool_idx
+
+            # ReplaySSM: temporal_state may lag by write_pos tokens (ring not flushed).
+            # Cap token_ids to the last flush boundary so the checkpoint is consistent.
+            write_pos_buf = getattr(mp, "replayssm_write_pos", None)
+            if write_pos_buf is not None:
+                write_pos = int(write_pos_buf[idx].item()) if idx < len(write_pos_buf) else 0
+                if write_pos > 0 and write_pos < len(token_ids):
+                    token_ids = token_ids[:len(token_ids) - write_pos]
+                    if not token_ids:
+                        return  # nothing to store (entire prefix is in the ring)
+
             temporal = mc.temporal[:, idx, :, :, :]
             conv = [cs[:, idx, ...] for cs in mc.conv] if isinstance(mc.conv, (list, tuple)) else [mc.conv[:, idx, ...]]
             if self._mamba_connector._enable_donate:
@@ -2342,6 +2353,10 @@ class FlexKVConnector:
                     cs[:, idx, ...].copy_(conv_src[i], non_blocking=True)
             else:
                 mp.conv[:, idx, ...].copy_(conv_src[0], non_blocking=True)
+            # ReplaySSM: reset write_pos — restored state is at a flush boundary
+            write_pos_buf = getattr(mp, "replayssm_write_pos", None)
+            if write_pos_buf is not None and idx < len(write_pos_buf):
+                write_pos_buf[idx].fill_(0)
             self._mamba_connector.release_retrieve(prefix_hash)
             return True
         except Exception as exc:
