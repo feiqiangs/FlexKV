@@ -70,6 +70,9 @@ class MambaStateConfig:
     # int8 compression
     enable_int8_compress: bool = True
 
+    # L3 SSD
+    ssd_dir: str = ""  # directory for SSD spill (empty = disabled)
+
     # Write policy: "write_back" (default, store on eviction) or
     # "write_through" (proactively D2H+int8 after N hits).
     write_policy: str = "write_back"
@@ -146,8 +149,13 @@ class MambaStateConnectorBase:
         self._prefix_refcount: Dict[str, int] = {}
 
         # L3 transfer tracking (SSD / Remote paths)
+        self._ssd_dir: str = config.ssd_dir
         self._ssd_paths: Dict[str, str] = {}  # prefix_hash → ssd file path
         self._remote_keys: Dict[str, str] = {}  # prefix_hash → remote key
+
+        import os
+        if self._ssd_dir:
+            os.makedirs(self._ssd_dir, exist_ok=True)
 
         # In-flight store tracking (P1-1/P1-3: completion tracking)
         self._inflight_stores: set = set()
@@ -253,9 +261,9 @@ class MambaStateConnectorBase:
             self._prefix_lengths.add(len(token_ids))  # P1-6: track length
             self._store_count += 1
 
-            # TODO: L3 async spill to SSD / Remote via transfer engine
-            # if self._transfer_engine and self._config.num_ssd_slots > 0:
-            #     self._spill_to_ssd(prefix_hash, ckpt_slot)
+            # L3 spill to SSD (if enabled)
+            if self._ssd_dir:
+                self._spill_to_ssd(prefix_hash, ckpt_slot)
 
             logger.debug(
                 "[FlexKV-Mamba] store: prefix=%s... slot=%d (total stored=%d)",
@@ -555,8 +563,65 @@ class MambaStateConnectorBase:
                     )
                     return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
 
+        # L3 SSD fallback: check all prefix lengths in SSD
+        if self._ssd_dir:
+            ssd_prefix = self._hash_prefix(token_ids)
+            if ssd_prefix in self._ssd_paths:
+                return self._load_from_ssd(ssd_prefix)
+            for end in candidates:
+                ssd_prefix = self._hash_prefix(token_ids[:end])
+                if ssd_prefix in self._ssd_paths:
+                    return self._load_from_ssd(ssd_prefix)
+
         logger.debug("[FlexKV-Mamba] retrieve: miss (no matching prefix)")
         return None
+
+    # ------------------------------------------------------------------
+    # L3 SSD spill / load
+    # ------------------------------------------------------------------
+
+    def _spill_to_ssd(self, prefix_hash: str, ckpt_slot: int) -> None:
+        """Serialize int8 checkpoint slot to SSD file."""
+        import os
+        file_path = os.path.join(self._ssd_dir, f"{prefix_hash}.pt")
+        try:
+            torch.save({
+                "qdata": self._ckpt_pool.qdata[:, ckpt_slot].clone(),
+                "scale": self._ckpt_pool.scale[:, ckpt_slot].clone(),
+                "conv": [c[:, ckpt_slot].clone() for c in self._ckpt_pool.conv],
+            }, file_path)
+            self._ssd_paths[prefix_hash] = file_path
+            self._prefix_lengths.add(0)  # ensure miss path checks SSD
+        except Exception as exc:
+            logger.debug("[FlexKV-Mamba] SSD spill failed: %s", exc)
+
+    def _load_from_ssd(self, prefix_hash: str) -> Optional[Tuple[str, torch.Tensor, List[torch.Tensor]]]:
+        """Load from SSD, store to int8 pool, return (prefix_hash, temporal, conv)."""
+        import os
+        file_path = self._ssd_paths.get(prefix_hash)
+        if file_path is None or not os.path.exists(file_path):
+            return None
+        try:
+            data = torch.load(file_path, map_location="cpu")
+            ckpt_slot = self._ckpt_pool.allocate()
+            if ckpt_slot is None:
+                evicted = self._evict_lru()
+                if evicted is not None:
+                    ckpt_slot = self._ckpt_pool.allocate()
+            if ckpt_slot is None:
+                return None
+            self._ckpt_pool.qdata[:, ckpt_slot].copy_(data["qdata"])
+            self._ckpt_pool.scale[:, ckpt_slot].copy_(data["scale"])
+            for i, c in enumerate(self._ckpt_pool.conv):
+                c[:, ckpt_slot].copy_(data["conv"][i])
+            self._prefix_map[prefix_hash] = ckpt_slot
+            self._slot_to_prefix[ckpt_slot] = prefix_hash
+            temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
+            logger.debug("[FlexKV-Mamba] SSD load: prefix=%s...", prefix_hash[:12])
+            return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
+        except Exception as exc:
+            logger.debug("[FlexKV-Mamba] SSD load failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Lock reference: prevent evicting checkpoints in active use

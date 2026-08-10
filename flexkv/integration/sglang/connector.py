@@ -2284,6 +2284,7 @@ class FlexKVConnector:
             num_donate_slots=int(os.environ.get("FLEXKV_MAMBA_DONATE_SLOTS", "64")),
             write_policy=os.environ.get("FLEXKV_MAMBA_WRITE_POLICY", "write_back"),
             write_through_threshold=int(os.environ.get("FLEXKV_MAMBA_WRITE_THROUGH_THRESHOLD", "2")),
+            ssd_dir=os.environ.get("FLEXKV_MAMBA_SSD_DIR", ""),
         )
 
         self._mamba_connector = MambaStateConnectorBase(config)
