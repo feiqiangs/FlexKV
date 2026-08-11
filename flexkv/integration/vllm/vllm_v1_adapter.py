@@ -615,7 +615,7 @@ class FlexKVSchedulerConnector:
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
         if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0:
             device_slots = getattr(first_ssm, "shape", [0, 256])[1]
-            num_cpu_slots = int(device_slots * GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio * 2)
+            num_cpu_slots = int(device_slots * GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio)  # slot count ratio, aligned with sglang
         else:
             scale_bytes = first_ssm.element_size()
             temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * 1

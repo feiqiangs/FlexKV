@@ -2285,12 +2285,11 @@ class FlexKVConnector:
         # Otherwise → FLEXKV_CPU_CACHE_GB (default 16) absolute GB mode.
         # Both KV and mamba share the same config — each gets cpu_cache_gb GB
         # (or device × ratio), not split from a single pool.
-        import math
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
         if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0:
             ratio = GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio
             device_slots = getattr(mamba_pool, "size", 256)
-            num_cpu_slots = int(device_slots * ratio * 2)  # 2x for int8
+            num_cpu_slots = int(device_slots * ratio)  # slot count ratio, aligned with sglang
         else:
             # Absolute GB: compute per-slot byte size, then derive slot count.
             # slot = L × (H × dv × dk × 1 int8 + H × dk × scale_bytes) + L × conv_bytes
