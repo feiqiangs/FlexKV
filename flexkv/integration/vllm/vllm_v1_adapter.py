@@ -610,6 +610,26 @@ class FlexKVSchedulerConnector:
         else:
             conv_shapes.append((4, num_heads * head_v_dim))  # fallback
 
+        # Capacity derivation (aligned with sglang --hicache-ratio / --hicache-size).
+        import math
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+        if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0:
+            device_slots = getattr(first_ssm, "shape", [0, 256])[1]
+            num_cpu_slots = int(device_slots * GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio * 2)
+        else:
+            scale_bytes = first_ssm.element_size()
+            temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * 1
+            scale_total = num_layers * num_heads * head_k_dim * scale_bytes
+            conv_total = sum(
+                num_layers * int(math.prod(s)) * first_ssm.element_size()
+                for s in conv_shapes
+            )
+            slot_bytes = temporal_bytes + scale_total + conv_total
+            num_cpu_slots = max(
+                1,
+                int(GLOBAL_CONFIG_FROM_ENV.cpu_cache_gb * 1e9 / slot_bytes),
+            )
+
         config = MambaStateConfig(
             num_linear_layers=num_layers,
             num_heads=num_heads,
@@ -618,7 +638,7 @@ class FlexKVSchedulerConnector:
             conv_shapes=conv_shapes,
             conv_dtype=first_ssm.dtype,
             temporal_dtype=first_ssm.dtype,
-            num_cpu_slots=int(os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "2048")),
+            num_cpu_slots=num_cpu_slots,
         )
 
         self._mamba_connector = MambaStateConnectorBase(config)

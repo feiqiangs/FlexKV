@@ -824,11 +824,13 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
         os.getenv('FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S', 900)
     ),
 
-    # Cache capacity ratio (global: token KV + mamba)
-    cpu_cache_ratio=float(os.getenv('FLEXKV_CPU_CACHE_RATIO', '0')),  # 0 = use config file
+    # Cache capacity (global: token KV + mamba).
+    # ratio > 0 → ratio mode (overrides GB), aligned with sglang --hicache-ratio.
+    # Otherwise → cpu_cache_gb mode (default 16), aligned with sglang --hicache-size.
+    cpu_cache_ratio=float(os.getenv('FLEXKV_CPU_CACHE_RATIO', '0')),
+    cpu_cache_gb=float(os.getenv('FLEXKV_CPU_CACHE_GB', '16')),
 
     # Mamba state (mamba-specific, no token KV equivalent)
-    mamba_cpu_slots=int(os.getenv('FLEXKV_MAMBA_CPU_SLOTS', 0)),  # 0 = auto from ratio
     mamba_decode_interval=int(os.getenv('FLEXKV_MAMBA_DECODE_INTERVAL', 256)),
 )
 

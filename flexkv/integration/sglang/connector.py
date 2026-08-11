@@ -2280,17 +2280,32 @@ class FlexKVConnector:
         conv_dtype = conv_states[0].dtype
         temporal_dtype = temporal.dtype
 
-        # Capacity: if FLEXKV_MAMBA_CPU_SLOTS is set, use it directly.
-        # Otherwise derive from device pool size × ratio (aligned with
-        # sglang --hicache-ratio). int8 compression gives 2x, so
-        # cpu_slots = device_slots × ratio × 2.
+        # Capacity derivation (aligned with sglang --hicache-ratio / --hicache-size).
+        # Priority: FLEXKV_CPU_CACHE_RATIO > 0 → ratio mode (overrides GB).
+        # Otherwise → FLEXKV_CPU_CACHE_GB (default 16) absolute GB mode.
+        # Both KV and mamba share the same config — each gets cpu_cache_gb GB
+        # (or device × ratio), not split from a single pool.
+        import math
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
-        if GLOBAL_CONFIG_FROM_ENV.mamba_cpu_slots > 0:
-            num_cpu_slots = GLOBAL_CONFIG_FROM_ENV.mamba_cpu_slots
-        else:
-            ratio = GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0 else 2.0
+        if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0:
+            ratio = GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio
             device_slots = getattr(mamba_pool, "size", 256)
             num_cpu_slots = int(device_slots * ratio * 2)  # 2x for int8
+        else:
+            # Absolute GB: compute per-slot byte size, then derive slot count.
+            # slot = L × (H × dv × dk × 1 int8 + H × dk × scale_bytes) + L × conv_bytes
+            scale_bytes = temporal.element_size()  # bf16=2, fp32=4
+            temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * 1
+            scale_total = num_layers * num_heads * head_k_dim * scale_bytes
+            conv_total = sum(
+                num_layers * int(math.prod(s)) * conv_states[0].element_size()
+                for s in conv_shapes
+            )
+            slot_bytes = temporal_bytes + scale_total + conv_total
+            num_cpu_slots = max(
+                1,
+                int(GLOBAL_CONFIG_FROM_ENV.cpu_cache_gb * 1e9 / slot_bytes),
+            )
 
         # SSD dir: reuse FlexKV global ssd_cache_dir (not mamba-specific)
         ssd_dir = ""
