@@ -2292,15 +2292,15 @@ class FlexKVConnector:
             num_cpu_slots = int(device_slots * ratio)  # slot count ratio, aligned with sglang
         else:
             # Absolute GB: compute per-slot byte size, then derive slot count.
-            # slot = L × (H × dv × dk × 1 int8 + H × dk × scale_bytes) + L × conv_bytes
-            scale_bytes = temporal.element_size()  # bf16=2, fp32=4
-            temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * 1
-            scale_total = num_layers * num_heads * head_k_dim * scale_bytes
+            # slot = L × (H × dv × dk × dtype_bytes) + L × conv_bytes
+            # Default bf16 (2 bytes). int8 is a future extension.
+            dtype_bytes = temporal.element_size()  # bf16=2
+            temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * dtype_bytes
             conv_total = sum(
                 num_layers * int(math.prod(s)) * conv_states[0].element_size()
                 for s in conv_shapes
             )
-            slot_bytes = temporal_bytes + scale_total + conv_total
+            slot_bytes = temporal_bytes + conv_total
             num_cpu_slots = max(
                 1,
                 int(GLOBAL_CONFIG_FROM_ENV.cpu_cache_gb * 1e9 / slot_bytes),

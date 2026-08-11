@@ -32,7 +32,9 @@ class MambaStatePoolConfig:
     evict_ratio: float = 0.1
 
     # --- compression ---
-    compress_dtype: torch.dtype = torch.int8
+    # bf16: lossless, aligned with sglang HiCache host pool (default).
+    # int8: 2x capacity, aligned with sglang Int8CheckpointStore (future extension).
+    compress_dtype: torch.dtype = torch.bfloat16
     scale_dtype: torch.dtype = torch.bfloat16
 
     @property

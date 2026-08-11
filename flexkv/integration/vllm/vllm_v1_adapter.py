@@ -617,14 +617,13 @@ class FlexKVSchedulerConnector:
             device_slots = getattr(first_ssm, "shape", [0, 256])[1]
             num_cpu_slots = int(device_slots * GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio)  # slot count ratio, aligned with sglang
         else:
-            scale_bytes = first_ssm.element_size()
-            temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * 1
-            scale_total = num_layers * num_heads * head_k_dim * scale_bytes
+            dtype_bytes = first_ssm.element_size()  # bf16=2
+            temporal_bytes = num_layers * num_heads * head_v_dim * head_k_dim * dtype_bytes
             conv_total = sum(
                 num_layers * int(math.prod(s)) * first_ssm.element_size()
                 for s in conv_shapes
             )
-            slot_bytes = temporal_bytes + scale_total + conv_total
+            slot_bytes = temporal_bytes + conv_total
             num_cpu_slots = max(
                 1,
                 int(GLOBAL_CONFIG_FROM_ENV.cpu_cache_gb * 1e9 / slot_bytes),

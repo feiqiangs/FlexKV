@@ -67,8 +67,8 @@ class MambaStateConfig:
     num_ssd_slots: int = 0
     num_remote_slots: int = 0
 
-    # int8 compression
-    enable_int8_compress: bool = True
+    # int8 compression (future extension, default off — bf16 is default)
+    enable_int8_compress: bool = False
 
     # L3 SSD
     ssd_dir: str = ""  # directory for SSD spill (empty = disabled)

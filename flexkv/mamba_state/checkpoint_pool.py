@@ -145,16 +145,20 @@ class MambaCheckpointPool:
             temporal_bf16: [L, H, d_v, d_k] bf16 from active pool
             conv_bf16: [L, *conv_shape] bf16 or List of bf16 (multi-conv-type)
         """
-        qdata, scale = self.quantize(temporal_bf16)
-        self.qdata[:, slot_id].copy_(qdata)
-        self.scale[:, slot_id].copy_(scale)
+        if self.config.compress_dtype == torch.int8:
+            qdata, scale = self.quantize(temporal_bf16)
+            self.qdata[:, slot_id].copy_(qdata)
+            self.scale[:, slot_id].copy_(scale)
+        else:
+            # bf16 mode: store directly without quantization
+            self.qdata[:, slot_id].copy_(temporal_bf16)
         if isinstance(conv_bf16, (list, tuple)):
             for i, cb in enumerate(conv_bf16):
                 self.conv[i][:, slot_id].copy_(cb)
         else:
             self.conv[0][:, slot_id].copy_(conv_bf16)
 
-    # --- dequantization (load path: cached int8 → active bf16) ------------
+    # --- dequantization (load path: cached → active bf16) ----------------
 
     def load_to_active(self, slot_id: int) -> Tuple[torch.Tensor, Any]:
         """Decompress one cached slot back to bf16 tensors (CoW target).
@@ -162,9 +166,13 @@ class MambaCheckpointPool:
         Returns (temporal_bf16, conv_bf16) — caller copies into active slot.
         conv_bf16 is a single tensor if 1 conv type, or a list if multi.
         """
-        temporal_bf16 = self.dequantize(
-            self.qdata[:, slot_id], self.scale[:, slot_id]
-        )
+        if self.config.compress_dtype == torch.int8:
+            temporal_bf16 = self.dequantize(
+                self.qdata[:, slot_id], self.scale[:, slot_id]
+            )
+        else:
+            # bf16 mode: no dequantization needed
+            temporal_bf16 = self.qdata[:, slot_id].clone()
         if self._num_conv_types == 1:
             conv_bf16 = self.conv[0][:, slot_id].clone()
         else:
