@@ -189,7 +189,28 @@ class FlexKVConnector:
                 "scatter/barrier/all_reduce are skipped."
             )
 
-        # 3. Align block counts across all ranks (MIN reduce) so each
+        # 3. If FLEXKV_CPU_CACHE_RATIO is set, derive num_cpu_blocks from
+        # GPU pool size (same mechanism as sglang --hicache-ratio).
+        # Applies to token KV too, not just mamba.
+        ratio_env = os.environ.get("FLEXKV_CPU_CACHE_RATIO", "")
+        if ratio_env:
+            ratio = float(ratio_env)
+            gpu_blocks = getattr(kvcache, "size", 0)
+            if not gpu_blocks:
+                # Try summing known pool attributes (DSv4 multi-pool)
+                for attr in ("c4_kv_pool", "c128_kv_pool", "swa_kv_pool"):
+                    pool = getattr(kvcache, attr, None)
+                    if pool is not None:
+                        gpu_blocks += getattr(pool, "size", 0)
+            if gpu_blocks > 0:
+                derived = int(gpu_blocks * ratio)
+                logger.info(
+                    "[FlexKV] FLEXKV_CPU_CACHE_RATIO=%s: num_cpu_blocks %d -> %d (gpu_blocks=%d)",
+                    ratio_env, self.cache_config.num_cpu_blocks, derived, gpu_blocks,
+                )
+                self.cache_config.num_cpu_blocks = derived
+
+        # 4. Align block counts across all ranks (MIN reduce) so each
         # rank's KVManager registers compatible sizes.
         for attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
             orig = getattr(self.cache_config, attr, None)
