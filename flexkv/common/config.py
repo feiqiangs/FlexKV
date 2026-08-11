@@ -829,9 +829,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Otherwise → cpu_cache_gb mode (default 16), aligned with sglang --hicache-size.
     cpu_cache_ratio=float(os.getenv('FLEXKV_CPU_CACHE_RATIO', '0')),
     cpu_cache_gb=float(os.getenv('FLEXKV_CPU_CACHE_GB', '16')),
-
-    # Mamba state (mamba-specific, no token KV equivalent)
-    mamba_decode_interval=int(os.getenv('FLEXKV_MAMBA_DECODE_INTERVAL', 256)),
 )
 
 @dataclass
