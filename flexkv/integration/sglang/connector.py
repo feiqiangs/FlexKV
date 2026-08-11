@@ -2267,9 +2267,17 @@ class FlexKVConnector:
         if int(cpu_slots_env) > 0:
             num_cpu_slots = int(cpu_slots_env)
         else:
-            ratio = float(os.environ.get("FLEXKV_MAMBA_HICACHE_RATIO", "2.0"))
+            ratio = float(os.environ.get("FLEXKV_HICACHE_RATIO", "2.0"))
             device_slots = getattr(mamba_pool, "size", 256)
             num_cpu_slots = int(device_slots * ratio * 2)  # 2x for int8
+
+        # SSD dir: reuse FlexKV global ssd_cache_dir (not mamba-specific)
+        ssd_dir = ""
+        cache_cfg = getattr(self, "cache_config", None)
+        if cache_cfg is not None:
+            raw = getattr(cache_cfg, "ssd_cache_dir", None)
+            if raw:
+                ssd_dir = raw[0] if isinstance(raw, (list, tuple)) else raw
 
         config = MambaStateConfig(
             num_linear_layers=num_layers,
@@ -2282,9 +2290,9 @@ class FlexKVConnector:
             num_cpu_slots=num_cpu_slots,
             enable_donate=os.environ.get("FLEXKV_MAMBA_DONATE", "0") == "1",
             num_donate_slots=int(os.environ.get("FLEXKV_MAMBA_DONATE_SLOTS", "64")),
-            write_policy=os.environ.get("FLEXKV_MAMBA_WRITE_POLICY", "write_back"),
-            write_through_threshold=int(os.environ.get("FLEXKV_MAMBA_WRITE_THROUGH_THRESHOLD", "2")),
-            ssd_dir=os.environ.get("FLEXKV_MAMBA_SSD_DIR", ""),
+            write_policy=os.environ.get("FLEXKV_WRITE_POLICY", "write_back"),
+            write_through_threshold=int(os.environ.get("FLEXKV_WRITE_THROUGH_THRESHOLD", "2")),
+            ssd_dir=ssd_dir,
         )
 
         self._mamba_connector = MambaStateConnectorBase(config)
