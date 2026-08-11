@@ -2309,8 +2309,8 @@ class FlexKVConnector:
             conv_dtype=conv_dtype,
             temporal_dtype=temporal_dtype,
             num_cpu_slots=num_cpu_slots,
-            enable_donate=GLOBAL_CONFIG_FROM_ENV.mamba_donate,
-            num_donate_slots=GLOBAL_CONFIG_FROM_ENV.mamba_donate_slots,
+            enable_donate=False,  # sglang native donate handles GPU tier (§2.4)
+            num_donate_slots=0,
             write_policy=GLOBAL_CONFIG_FROM_ENV.write_policy,
             write_through_threshold=GLOBAL_CONFIG_FROM_ENV.write_through_threshold,
             ssd_dir=ssd_dir,

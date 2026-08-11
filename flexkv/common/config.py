@@ -830,11 +830,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     cpu_cache_ratio=float(os.getenv('FLEXKV_CPU_CACHE_RATIO', '0')),  # 0 = use config file
 
     # Mamba state (mamba-specific, no token KV equivalent)
-    mamba_donate=bool(int(os.getenv('FLEXKV_MAMBA_DONATE', 0))),
-    mamba_donate_slots=int(os.getenv('FLEXKV_MAMBA_DONATE_SLOTS', 64)),
     mamba_cpu_slots=int(os.getenv('FLEXKV_MAMBA_CPU_SLOTS', 0)),  # 0 = auto from ratio
     mamba_decode_interval=int(os.getenv('FLEXKV_MAMBA_DECODE_INTERVAL', 256)),
-    mamba_chunk_size=int(os.getenv('FLEXKV_MAMBA_CHUNK_SIZE', 1)),
 )
 
 @dataclass
