@@ -824,9 +824,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
         os.getenv('FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S', 900)
     ),
 
-    # Cache write policy (global: applies to token KV and mamba state)
-    write_policy=os.getenv('FLEXKV_WRITE_POLICY', 'write_through'),
-    write_through_threshold=int(os.getenv('FLEXKV_WRITE_THROUGH_THRESHOLD', 2)),
+    # Cache capacity ratio (global: token KV + mamba)
     cpu_cache_ratio=float(os.getenv('FLEXKV_CPU_CACHE_RATIO', '0')),  # 0 = use config file
 
     # Mamba state (mamba-specific, no token KV equivalent)

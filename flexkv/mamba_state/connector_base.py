@@ -73,11 +73,6 @@ class MambaStateConfig:
     # L3 SSD
     ssd_dir: str = ""  # directory for SSD spill (empty = disabled)
 
-    # Write policy: "write_through" (default, proactive D2H) or
-    # "write_back" (deferred D2H on eviction).
-    write_policy: str = "write_through"
-    write_through_threshold: int = 2  # hit count to trigger proactive backup
-
 
 class MambaStateConnectorBase:
     """Framework-agnostic mamba state L2/L3 manager.
@@ -115,8 +110,6 @@ class MambaStateConnectorBase:
         )
         self._ckpt_pool = MambaCheckpointPool(pool_config, device="cpu")
 
-        self._write_policy = config.write_policy
-        self._write_through_threshold = config.write_through_threshold
 
         # Prefix hash → checkpoint slot mapping (LRU ordered)
         self._prefix_map: OrderedDict[str, int] = OrderedDict()
