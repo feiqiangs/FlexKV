@@ -2309,8 +2309,6 @@ class FlexKVConnector:
             conv_dtype=conv_dtype,
             temporal_dtype=temporal_dtype,
             num_cpu_slots=num_cpu_slots,
-            enable_donate=False,  # sglang native donate handles GPU tier (§2.4)
-            num_donate_slots=0,
             write_policy=GLOBAL_CONFIG_FROM_ENV.write_policy,
             write_through_threshold=GLOBAL_CONFIG_FROM_ENV.write_through_threshold,
             ssd_dir=ssd_dir,
@@ -2324,7 +2322,7 @@ class FlexKVConnector:
         return self._has_mamba
 
     def store_mamba_state(self, rid, token_ids, mamba_pool_idx):
-        """Snapshot mamba state from GPU -> FlexKV L1.5(donate)/L2(int8)/L3."""
+        """Snapshot mamba state from GPU -> FlexKV L2(int8)/L3(SSD)."""
         if not self._has_mamba or self._mamba_connector is None:
             return
         if mamba_pool_idx is None or mamba_pool_idx < 0:
@@ -2346,10 +2344,7 @@ class FlexKVConnector:
 
             temporal = mc.temporal[:, idx, :, :, :]
             conv = [cs[:, idx, ...] for cs in mc.conv] if isinstance(mc.conv, (list, tuple)) else [mc.conv[:, idx, ...]]
-            if self._mamba_connector._enable_donate:
-                self._mamba_connector.store_donate(token_ids, temporal, conv)
-            else:
-                self._mamba_connector.store(token_ids, temporal, conv)
+            self._mamba_connector.store(token_ids, temporal, conv)
         except Exception as exc:
             logger.warning("[FlexKV-Mamba] store_mamba_state failed: %s", exc)
 
