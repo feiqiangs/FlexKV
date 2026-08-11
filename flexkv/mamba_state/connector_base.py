@@ -130,9 +130,15 @@ class MambaStateConnectorBase:
         self._prefix_refcount: Dict[str, int] = {}
 
         # Tombstone: evicted checkpoints (prefix_hash → token_count).
+        # LRU ordered, capped at _max_tombstones to prevent unbounded growth.
         # Allows gap recompute to know where the last checkpoint WAS,
         # even after eviction. Looked up by shorter-prefix search.
-        self._tombstones: Dict[str, int] = {}
+        self._tombstones: OrderedDict[str, int] = OrderedDict()
+        self._max_tombstones = 1000
+
+        # Evictable set: entries with refcount == 0 and not branch point.
+        # Maintained as LRU OrderedDict for O(1) eviction selection.
+        self._evictable: OrderedDict[str, int] = OrderedDict()
 
         # L3 transfer tracking (SSD / Remote paths)
         self._ssd_dir: str = config.ssd_dir
@@ -243,6 +249,7 @@ class MambaStateConnectorBase:
 
             # Register in prefix map
             self._prefix_map[prefix_hash] = ckpt_slot
+            self._evictable[prefix_hash] = ckpt_slot
             self._slot_to_prefix[ckpt_slot] = prefix_hash
             self._prefix_lengths.add(len(token_ids))  # P1-6: track length
             self._store_count += 1
@@ -424,6 +431,7 @@ class MambaStateConnectorBase:
             for i, c in enumerate(self._ckpt_pool.conv):
                 c[:, ckpt_slot].copy_(data["conv"][i])
             self._prefix_map[prefix_hash] = ckpt_slot
+            self._evictable[prefix_hash] = ckpt_slot
             self._slot_to_prefix[ckpt_slot] = prefix_hash
             temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
             logger.debug("[FlexKV-Mamba] SSD load: prefix=%s...", prefix_hash[:12])
@@ -439,12 +447,16 @@ class MambaStateConnectorBase:
     def _acquire_ref(self, prefix_hash: str) -> None:
         """Increment refcount for a prefix (called before retrieve reads slot)."""
         self._prefix_refcount[prefix_hash] = self._prefix_refcount.get(prefix_hash, 0) + 1
+        self._evictable.pop(prefix_hash, None)
 
     def _release_ref(self, prefix_hash: str) -> None:
         """Decrement refcount for a prefix (called after copy to GPU completes)."""
         cnt = self._prefix_refcount.get(prefix_hash, 0)
         if cnt <= 1:
             self._prefix_refcount.pop(prefix_hash, None)
+            # Refcount dropped to 0 — add to evictable if not a branch point
+            if prefix_hash in self._prefix_map and prefix_hash not in self._branch_points:
+                self._evictable[prefix_hash] = self._prefix_map[prefix_hash]
         else:
             self._prefix_refcount[prefix_hash] = cnt - 1
 
@@ -460,40 +472,38 @@ class MambaStateConnectorBase:
     def _evict_lru(self) -> Optional[int]:
         """Evict the least recently used checkpoint slot.
 
-        Skips entries with refcount > 0 (active retrieve in flight).
-        Skips branch points (high priority) unless all are locked.
+        O(1) selection from _evictable set (refcount == 0, not branch point).
+        Falls back to branch points if no evictable entries.
         """
-        if not self._prefix_map:
-            return None
-
-        # Find first evictable entry: non-branch-point AND refcount == 0
-        prefix_hash = None
-        ckpt_slot = None
-        fallback = None  # branch-point but unlocked — last resort
-        for ph, slot in self._prefix_map.items():
-            if self._prefix_refcount.get(ph, 0) > 0:
-                continue  # locked by active retrieve
-            if ph in self._branch_points:
-                if fallback is None:
-                    fallback = (ph, slot)
-                continue
-            prefix_hash = ph
-            ckpt_slot = slot
-            break
-
-        if prefix_hash is None:
-            if fallback is not None:
-                prefix_hash, ckpt_slot = fallback
-            else:
-                logger.debug("[FlexKV-Mamba] evict LRU: no evictable slots (all locked or branch points)")
+        # Fast path: pick from evictable set
+        if self._evictable:
+            prefix_hash, ckpt_slot = self._evictable.popitem(last=False)
+        elif self._prefix_map:
+            # Fallback: scan for branch-point entries (last resort)
+            prefix_hash = None
+            ckpt_slot = None
+            for ph, slot in self._prefix_map.items():
+                if self._prefix_refcount.get(ph, 0) > 0:
+                    continue
+                if ph in self._branch_points:
+                    prefix_hash = ph
+                    ckpt_slot = slot
+                    break
+            if prefix_hash is None:
+                logger.debug("[FlexKV-Mamba] evict LRU: no evictable slots (all locked)")
                 return None
+        else:
+            return None
 
         del self._prefix_map[prefix_hash]
         self._slot_to_prefix.pop(ckpt_slot, None)
+        self._evictable.pop(prefix_hash, None)
         self._ckpt_pool.free(ckpt_slot)
-        # Create tombstone: remember the token count for gap recompute
-        # (scheduler can still find the boundary even after eviction)
-        self._tombstones[prefix_hash] = len(prefix_hash)  # approximate token count
+
+        # Create tombstone (LRU capped)
+        self._tombstones[prefix_hash] = len(prefix_hash)
+        if len(self._tombstones) > self._max_tombstones:
+            self._tombstones.popitem(last=False)  # remove oldest
 
         logger.debug(
             "[FlexKV-Mamba] evict LRU: prefix=%s... slot=%d",
@@ -507,6 +517,7 @@ class MambaStateConnectorBase:
 
         Returns token count of the nearest tombstone, or 0 if none.
         Used for gap recompute when the checkpoint was evicted.
+        Moves accessed tombstone to MRU (keeps recently-useful boundaries).
         """
         candidates = sorted(
             [l for l in self._prefix_lengths if l < len(token_ids)],
@@ -515,6 +526,7 @@ class MambaStateConnectorBase:
         for end in candidates:
             ph = self._hash_prefix(token_ids[:end])
             if ph in self._tombstones:
+                self._tombstones.move_to_end(ph)  # MRU
                 return end
         return 0
 
@@ -524,6 +536,7 @@ class MambaStateConnectorBase:
         with self._lock:
             if prefix_hash in self._prefix_map:
                 self._branch_points.add(prefix_hash)
+                self._evictable.pop(prefix_hash, None)  # remove from evictable
                 self._prefix_map.move_to_end(prefix_hash)  # move to MRU
                 logger.debug("[FlexKV-Mamba] marked branch point: %s...", prefix_hash[:12])
 
@@ -563,6 +576,7 @@ class MambaStateConnectorBase:
             self._branch_points.clear()
             self._prefix_refcount.clear()
             self._tombstones.clear()
+            self._evictable.clear()
             self._ckpt_pool.reset()
             self._ssd_paths.clear()
             self._remote_keys.clear()
