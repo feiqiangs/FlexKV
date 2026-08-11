@@ -638,6 +638,7 @@ class FlexKVSchedulerConnector:
             conv_dtype=first_ssm.dtype,
             temporal_dtype=first_ssm.dtype,
             num_cpu_slots=num_cpu_slots,
+            ssd_dir=getattr(getattr(self, 'cache_config', None), 'ssd_cache_dir', '') or '',
         )
 
         self._mamba_connector = MambaStateConnectorBase(config)

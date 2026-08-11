@@ -23,13 +23,9 @@ class MambaStatePoolConfig:
     head_k_dim: int = 0
     conv_shape: Tuple[int, ...] = ()
     conv_shapes: List[Tuple[int, ...]] = ()  # multi-conv-type: list of shapes per conv type
-    conv_shard_groups: Optional[List[int]] = None
-    is_kda: bool = False
 
     # --- pool sizing (derived from FlexKV CacheConfig) ---
-    num_active_slots: int = 256
     num_cpu_slots: int = 2048
-    evict_ratio: float = 0.1
 
     # --- dtypes (auto-read from framework pool, no compression) ---
     temporal_dtype: torch.dtype = torch.bfloat16

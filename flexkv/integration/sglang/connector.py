@@ -206,7 +206,7 @@ class FlexKVConnector:
                 derived = int(gpu_blocks * ratio)
                 logger.info(
                     "[FlexKV] FLEXKV_CPU_CACHE_RATIO=%s: num_cpu_blocks %d -> %d (gpu_blocks=%d)",
-                    ratio_env, self.cache_config.num_cpu_blocks, derived, gpu_blocks,
+                    ratio, self.cache_config.num_cpu_blocks, derived, gpu_blocks,
                 )
                 self.cache_config.num_cpu_blocks = derived
 
@@ -2334,7 +2334,7 @@ class FlexKVConnector:
         return self._has_mamba
 
     def store_mamba_state(self, rid, token_ids, mamba_pool_idx):
-        """Snapshot mamba state from GPU -> FlexKV L2(int8)/L3(SSD)."""
+        """Snapshot mamba state from GPU -> FlexKV L2(bf16)/L3(SSD)."""
         if not self._has_mamba or self._mamba_connector is None:
             return
         if mamba_pool_idx is None or mamba_pool_idx < 0:
@@ -2389,13 +2389,14 @@ class FlexKVConnector:
                 return False
             prefix_hash, temporal_src, conv_src = result
             mp = self._mamba_pool
+            mc = mp.mamba_cache
             idx = mamba_pool_idx
-            mp.temporal[:, idx, :, :, :].copy_(temporal_src, non_blocking=True)
-            if isinstance(mp.conv, (list, tuple)):
-                for i, cs in enumerate(mp.conv):
+            mc.temporal[:, idx, :, :, :].copy_(temporal_src, non_blocking=True)
+            if isinstance(mc.conv, (list, tuple)):
+                for i, cs in enumerate(mc.conv):
                     cs[:, idx, ...].copy_(conv_src[i], non_blocking=True)
             else:
-                mp.conv[:, idx, ...].copy_(conv_src[0], non_blocking=True)
+                mc.conv[:, idx, ...].copy_(conv_src[0], non_blocking=True)
             # ReplaySSM: reset write_pos — restored state is at a flush boundary
             write_pos_buf = getattr(mp, "replayssm_write_pos", None)
             if write_pos_buf is not None and idx < len(write_pos_buf):
@@ -2406,111 +2407,9 @@ class FlexKVConnector:
             logger.warning("[FlexKV-Mamba] retrieve_mamba_state failed: %s", exc)
             return False
 
-    def get_mamba_stats(self):
-        if self._mamba_connector is None:
-            return {}
-        return self._mamba_connector.get_stats()
 
-    # ------------------------------------------------------------------
-    # PD disaggregation: mamba state cross-instance transfer
-    # ------------------------------------------------------------------
 
-    def get_mamba_cpu_copy(self, mamba_pool_idx):
-        """Serialize GPU mamba state to CPU tensors for PD transfer.
 
-        Returns (temporal_cpu, conv_cpu_list) or None if no mamba.
-        """
-        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
-            return None
-        try:
-            mp = self._mamba_pool
-            mc = mp.mamba_cache
-            idx = mamba_pool_idx
-            temporal_cpu = mc.temporal[:, idx, :, :, :].detach().to("cpu", non_blocking=False)
-            if isinstance(mc.conv, (list, tuple)):
-                conv_cpu = [cs[:, idx, ...].detach().to("cpu", non_blocking=False) for cs in mc.conv]
-            else:
-                conv_cpu = [mc.conv[:, idx, ...].detach().to("cpu", non_blocking=False)]
-            return temporal_cpu, conv_cpu
-        except Exception as exc:
-            logger.warning("[FlexKV-Mamba] get_mamba_cpu_copy failed: %s", exc)
-            return None
 
-    def load_mamba_cpu_copy(self, mamba_pool_idx, cpu_tensors):
-        """Restore CPU tensors to GPU mamba slot (decode side of PD).
 
-        Args:
-            mamba_pool_idx: target GPU slot index
-            cpu_tensors: (temporal_cpu, conv_cpu_list) from get_mamba_cpu_copy
-        """
-        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
-            return False
-        if cpu_tensors is None:
-            return False
-        try:
-            temporal_cpu, conv_cpu = cpu_tensors
-            mp = self._mamba_pool
-            idx = mamba_pool_idx
-            mp.temporal[:, idx, :, :, :].copy_(temporal_cpu, non_blocking=True)
-            if isinstance(mp.conv, (list, tuple)):
-                for i, cs in enumerate(mp.conv):
-                    cs[:, idx, ...].copy_(conv_cpu[i], non_blocking=True)
-            else:
-                mp.conv[:, idx, ...].copy_(conv_cpu[0], non_blocking=True)
-            # Reset ReplaySSM write_pos (restored state is at a flush boundary)
-            write_pos_buf = getattr(mp, "replayssm_write_pos", None)
-            if write_pos_buf is not None and idx < len(write_pos_buf):
-                write_pos_buf[idx].fill_(0)
-            return True
-        except Exception as exc:
-            logger.warning("[FlexKV-Mamba] load_mamba_cpu_copy failed: %s", exc)
-            return False
 
-    # ------------------------------------------------------------------
-    # Spec decoding: save / restore intermediate mamba state
-    # ------------------------------------------------------------------
-
-    def save_mamba_spec_state(self, mamba_pool_idx):
-        """Save mamba state for speculative decoding rollback (GPU clone)."""
-        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
-            return False
-        try:
-            mp = self._mamba_pool
-            mc = mp.mamba_cache
-            idx = mamba_pool_idx
-            self._mamba_spec_backup = (
-                mc.temporal[:, idx, :, :, :].clone(),
-                [cs[:, idx, ...].clone() for cs in mc.conv] if isinstance(mc.conv, (list, tuple))
-                else [mc.conv[:, idx, ...].clone()],
-            )
-            return True
-        except Exception as exc:
-            logger.debug("[FlexKV-Mamba] save_mamba_spec_state: %s", exc)
-            return False
-
-    def restore_mamba_spec_state(self, mamba_pool_idx):
-        """Restore mamba state from spec backup (rollback on draft rejection)."""
-        if not self._has_mamba or mamba_pool_idx is None or mamba_pool_idx < 0:
-            return False
-        backup = getattr(self, "_mamba_spec_backup", None)
-        if backup is None:
-            return False
-        try:
-            temporal_bak, conv_bak = backup
-            mp = self._mamba_pool
-            mc = mp.mamba_cache
-            idx = mamba_pool_idx
-            mc.temporal[:, idx, :, :, :].copy_(temporal_bak)
-            if isinstance(mc.conv, (list, tuple)):
-                for i, cs in enumerate(mc.conv):
-                    cs[:, idx, ...].copy_(conv_bak[i])
-            else:
-                mc.conv[:, idx, ...].copy_(conv_bak[0])
-            return True
-        except Exception as exc:
-            logger.debug("[FlexKV-Mamba] restore_mamba_spec_state: %s", exc)
-            return False
-
-    def clear_mamba_spec_state(self):
-        """Clear spec backup (free GPU memory)."""
-        self._mamba_spec_backup = None

@@ -127,9 +127,6 @@ class TransferOp:
     is_swa: bool = False
     # ---- Linear-attention state routing ---------------------------------
     # When True, this op moves linear-attention recurrent state (an independent
-    # pool with its own slot-id space), routed to the linear-state worker.
-    # Reuses standard transfer_type; src/dst block ids are state-pool slot ids.
-    is_mamba_state: bool = False
     # Block content hashes for mooncake-store key-based addressing (main KV).
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     # Tail-hash list for SWA mooncake REMOTE2H/H2REMOTE (one entry per SWA slot).

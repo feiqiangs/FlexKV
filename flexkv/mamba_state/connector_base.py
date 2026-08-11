@@ -2,15 +2,15 @@
 
 This module provides the bridge between a framework's mamba state pool
 (sglang MambaPool / vLLM mamba pool) and FlexKV's multi-tier storage
-(CPU int8 / SSD / GDS / Remote).
+(CPU bf16 / SSD / Remote).
 
 Design:
   - L1 (GPU active state) = framework native (sglang MambaPool / vLLM pool)
-  - L2 (CPU int8 checkpoint) = FlexKV MambaCheckpointPool
+  - L2 (CPU bf16 checkpoint) = FlexKV MambaCheckpointPool
   - L3 (SSD / GDS / Remote) = FlexKV transfer engine
 
 The framework connector reads/writes mamba state tensors from/to the
-framework's pool. This module handles int8 quantization, prefix-keyed
+framework's pool. This module handles prefix-keyed
 storage, LRU eviction, and multi-tier transfer.
 
 Framework-agnostic: works with any inference framework that exposes
@@ -60,12 +60,10 @@ class MambaStateConfig:
     conv_dtype: torch.dtype
     temporal_dtype: torch.dtype = torch.bfloat16
 
-    # L2 sizing (CPU int8 checkpoint pool)
+    # L2 sizing (CPU bf16 checkpoint pool)
     num_cpu_slots: int = 2048
 
     # L3 (SSD / Remote) — 0 means disabled
-    num_ssd_slots: int = 0
-    num_remote_slots: int = 0
 
     # L3 SSD
     ssd_dir: str = ""  # directory for SSD spill (empty = disabled)
@@ -74,13 +72,13 @@ class MambaStateConfig:
 class MambaStateConnectorBase:
     """Framework-agnostic mamba state L2/L3 manager.
 
-    Owns a :class:`MambaCheckpointPool` (CPU int8) and coordinates
+    Owns a :class:`MambaCheckpointPool` (CPU bf16) and coordinates
     multi-tier transfer (SSD / Remote) through FlexKV's transfer engine.
 
     The framework connector calls:
-      - :meth:`store`   — snapshot from GPU → int8 → CPU/SSD/Remote
+      - :meth:`store`   — snapshot from GPU → bf16 → CPU/SSD/Remote
       - :meth:`lookup`  — check if mamba state exists for a prefix
-      - :meth:`retrieve`— load from CPU/SSD/Remote → dequantize → GPU
+      - :meth:`retrieve`— load from CPU/SSD/Remote → bf16 → GPU
 
     Thread-safety: all public methods are guarded by an internal lock.
     The framework connector is responsible for CUDA stream ordering.
@@ -147,14 +145,9 @@ class MambaStateConnectorBase:
         self._hit_count = 0
         self._retrieve_count = 0
 
-        # Prefetch: early retrieve on background thread
-        self._prefetch_results: Dict[str, Any] = {}
-        self._prefetch_threads: Dict[str, Any] = {}
-        self._prefetch_lock = threading.Lock()
-
         logger.info(
             "[FlexKV-Mamba] MambaStateConnectorBase initialized: "
-            "layers=%d heads=%d d_v=%d d_k=%d cpu_slots=%d int8=%s",
+            "layers=%d heads=%d d_v=%d d_k=%d cpu_slots=%d",
             config.num_linear_layers,
             config.num_heads,
             config.head_v_dim,
@@ -175,7 +168,7 @@ class MambaStateConnectorBase:
         return h.hexdigest()
 
     # ------------------------------------------------------------------
-    # Store: GPU snapshot → int8 → CPU/SSD/Remote
+    # Store: GPU snapshot → bf16 → CPU/SSD/Remote
     # ------------------------------------------------------------------
 
     def store(
@@ -218,11 +211,11 @@ class MambaStateConnectorBase:
                     logger.warning("[FlexKV-Mamba] store: checkpoint pool full, cannot store")
                     return prefix_hash
 
-            # Move GPU → CPU (non-blocking), then quantize + store
+            # Move GPU → CPU (non-blocking), then store
             temporal_cpu = temporal_state.detach().to("cpu", non_blocking=False)  # sync — avoid reading uninitialized data
             conv_cpu = [c.detach().to("cpu", non_blocking=False) for c in conv_state]  # sync
 
-            # int8 quantize temporal (conv stays bf16)
+            # Store temporal + conv at native dtype
             # Pool expects single conv tensor [L, *conv_shape]; connector
             # may receive a list (one per conv layer type). Use first
             # element or stack if multiple.
@@ -304,7 +297,7 @@ class MambaStateConnectorBase:
         return False, 0
 
     # ------------------------------------------------------------------
-    # Retrieve: CPU/SSD/Remote → dequantize → GPU
+    # Retrieve: CPU/SSD/Remote → bf16 → GPU
     # ------------------------------------------------------------------
 
     def retrieve(
@@ -315,24 +308,13 @@ class MambaStateConnectorBase:
 
         Returns:
             (prefix_hash, temporal_state, conv_state) if found, None if miss.
-            dequantized to bf16). The connector copies to the active slot.
+            at native dtype). The connector copies to the active slot.
 
         The caller MUST call release_retrieve(prefix_hash) after the GPU
         copy completes, to allow eviction of this checkpoint.
         """
         with self._lock:
             self._retrieve_count += 1
-
-        # Check prefetch cache first (early retrieve may have completed)
-        prefix_hash = self._hash_prefix(token_ids)
-        with self._prefetch_lock:
-            if prefix_hash in self._prefetch_results:
-                result = self._prefetch_results.pop(prefix_hash)
-                self._prefetch_threads.pop(prefix_hash, None)
-                if result is not None:
-                    self._acquire_ref(result[0])
-                    return result
-                return None
 
         prefix_hash = self._hash_prefix(token_ids)
         with self._lock:
@@ -393,12 +375,12 @@ class MambaStateConnectorBase:
                 "conv": [c[:, ckpt_slot].clone() for c in self._ckpt_pool.conv],
             }, file_path)
             self._ssd_paths[prefix_hash] = file_path
-            self._prefix_lengths.add(0)  # ensure miss path checks SSD
+            # SSD fallback checked in retrieve on miss
         except Exception as exc:
             logger.debug("[FlexKV-Mamba] SSD spill failed: %s", exc)
 
     def _load_from_ssd(self, prefix_hash: str) -> Optional[Tuple[str, torch.Tensor, List[torch.Tensor]]]:
-        """Load from SSD, store to int8 pool, return (prefix_hash, temporal, conv)."""
+        """Load from SSD, store to pool, return (prefix_hash, temporal, conv)."""
         import os
         file_path = self._ssd_paths.get(prefix_hash)
         if file_path is None or not os.path.exists(file_path):
@@ -565,89 +547,10 @@ class MambaStateConnectorBase:
             self._ckpt_pool.reset()
             self._ssd_paths.clear()
             self._remote_keys.clear()
-            with self._prefetch_lock:
-                self._prefetch_results.clear()
-                self._prefetch_threads.clear()
 
-    # --- P2-1: Prefetch support (early retrieve for overlap) ---
 
-    def prefetch_mamba_state(self, token_ids: List[int]) -> bool:
-        """Prefetch mamba state: start retrieve on background thread.
 
-        Kicks off the hash + dict lookup + dequant early (during match_prefix),
-        so init_load_back's retrieve returns the cached result immediately.
-        Returns True if prefetch was initiated, False if miss.
-        """
-        import threading
-        prefix_hash = self._hash_prefix(token_ids)
-        with self._lock:
-            if prefix_hash in self._prefetch_results:
-                return True  # already prefetched
 
-        def _do_prefetch():
-            result = self._retrieve_internal(token_ids)
-            with self._prefetch_lock:
-                self._prefetch_results[prefix_hash] = result
-
-        t = threading.Thread(target=_do_prefetch, daemon=True)
-        with self._prefetch_lock:
-            self._prefetch_threads[prefix_hash] = t
-        t.start()
-        return True
-
-    def _retrieve_internal(self, token_ids: List[int]):
-        """Internal retrieve without acquiring ref (prefetch uses this)."""
-        with self._lock:
-            self._retrieve_count += 1
-        prefix_hash = self._hash_prefix(token_ids)
-        with self._lock:
-            if prefix_hash in self._prefix_map:
-                ckpt_slot = self._prefix_map[prefix_hash]
-                self._prefix_map.move_to_end(prefix_hash)
-                temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
-                return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
-        candidates = sorted([l for l in self._prefix_lengths if l < len(token_ids)], reverse=True)
-        for end in candidates:
-            prefix_hash = self._hash_prefix(token_ids[:end])
-            with self._lock:
-                if prefix_hash in self._prefix_map:
-                    ckpt_slot = self._prefix_map[prefix_hash]
-                    self._prefix_map.move_to_end(prefix_hash)
-                    temporal, conv = self._ckpt_pool.load_to_active(ckpt_slot)
-                    return prefix_hash, temporal, [conv] if not isinstance(conv, (list, tuple)) else conv
-        return None
-
-    def check_prefetch_progress(self, token_ids: List[int]) -> bool:
-        """Check if prefetch has completed. Returns True if ready."""
-        prefix_hash = self._hash_prefix(token_ids)
-        with self._prefetch_lock:
-            return prefix_hash in self._prefetch_results
-
-    def cancel_prefetch(self, token_ids: List[int]) -> None:
-        """Cancel an in-flight prefetch."""
-        prefix_hash = self._hash_prefix(token_ids)
-        with self._prefetch_lock:
-            self._prefetch_results.pop(prefix_hash, None)
-            self._prefetch_threads.pop(prefix_hash, None)
-        pass  # stub
-
-    def evict_by_prefix(self, token_ids: List[int]) -> bool:
-        """Evict mamba state for a specific prefix (P1-4: linked eviction).
-
-        Called when the radix cache evicts a prefix node — the corresponding
-        mamba state should also be evicted to avoid stale entries.
-
-        Returns True if a state was evicted, False if not found.
-        """
-        prefix_hash = self._hash_prefix(token_ids)
-        with self._lock:
-            if prefix_hash not in self._prefix_map:
-                return False
-            ckpt_slot = self._prefix_map.pop(prefix_hash)
-            self._slot_to_prefix.pop(ckpt_slot, None)
-            self._ckpt_pool.free(ckpt_slot)
-            logger.debug("[FlexKV-Mamba] evict_by_prefix: %s...", prefix_hash[:12])
-            return True
 
     def shutdown(self) -> None:
         """Cleanup resources."""
