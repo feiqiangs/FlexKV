@@ -73,9 +73,9 @@ class MambaStateConfig:
     # L3 SSD
     ssd_dir: str = ""  # directory for SSD spill (empty = disabled)
 
-    # Write policy: "write_back" (default, store on eviction) or
-    # "write_through" (proactively D2H+int8 after N hits).
-    write_policy: str = "write_back"
+    # Write policy: "write_through" (default, proactive D2H) or
+    # "write_back" (deferred D2H on eviction).
+    write_policy: str = "write_through"
     write_through_threshold: int = 2  # hit count to trigger proactive backup
 
     # Donate: GPU-side bf16 checkpoint tier (no D2H, no int8).
