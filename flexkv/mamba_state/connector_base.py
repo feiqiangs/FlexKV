@@ -95,7 +95,6 @@ class MambaStateConnectorBase:
             num_heads=config.num_heads,
             head_v_dim=config.head_v_dim,
             head_k_dim=config.head_k_dim,
-            conv_shape=config.conv_shapes[0] if config.conv_shapes else (),
             conv_shapes=config.conv_shapes,
             num_cpu_slots=config.num_cpu_slots,
             temporal_dtype=config.temporal_dtype,

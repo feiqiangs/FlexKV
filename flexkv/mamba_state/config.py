@@ -4,7 +4,7 @@ Internal config auto-constructed by FlexKVConnector from sglang's MambaPool
 tensor shapes at registration time. Not user-facing — no YAML needed.
 """
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -21,8 +21,7 @@ class MambaStatePoolConfig:
     num_heads: int = 0
     head_v_dim: int = 0
     head_k_dim: int = 0
-    conv_shape: Tuple[int, ...] = ()
-    conv_shapes: List[Tuple[int, ...]] = ()  # multi-conv-type: list of shapes per conv type
+    conv_shapes: List[Tuple[int, ...]] = field(default_factory=list)
 
     # --- pool sizing (derived from FlexKV CacheConfig) ---
     num_cpu_slots: int = 2048
@@ -30,6 +29,11 @@ class MambaStatePoolConfig:
     # --- dtypes (auto-read from framework pool, no compression) ---
     temporal_dtype: torch.dtype = torch.bfloat16
     conv_dtype: torch.dtype = torch.bfloat16
+
+    @property
+    def conv_shape(self) -> Tuple[int, ...]:
+        """First conv shape (for single-conv-type models)."""
+        return self.conv_shapes[0] if self.conv_shapes else ()
 
     @property
     def state_bytes_per_layer(self) -> int:

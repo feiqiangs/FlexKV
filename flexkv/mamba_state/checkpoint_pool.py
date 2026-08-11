@@ -37,7 +37,7 @@ class MambaCheckpointPool:
         )
         # conv window at native dtype
         # Support multi-conv-type: allocate separate buffer per conv shape
-        conv_shapes = config.conv_shapes if config.conv_shapes else [config.conv_shape]
+        conv_shapes = config.conv_shapes  # always a list (default_factory=list)
         self.conv = [
             torch.empty(
                 (L, num_slots) + shape,
