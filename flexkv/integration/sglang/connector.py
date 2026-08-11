@@ -2267,7 +2267,7 @@ class FlexKVConnector:
         if int(cpu_slots_env) > 0:
             num_cpu_slots = int(cpu_slots_env)
         else:
-            ratio = float(os.environ.get("FLEXKV_HICACHE_RATIO", "2.0"))
+            ratio = float(os.environ.get("FLEXKV_CPU_CACHE_RATIO", "2.0"))
             device_slots = getattr(mamba_pool, "size", 256)
             num_cpu_slots = int(device_slots * ratio * 2)  # 2x for int8
 
