@@ -45,6 +45,7 @@ import torch
 from flexkv.common.block import SequenceMeta
 from flexkv.common.hash_utils import HashType, Hasher
 from flexkv.common.transfer import DeviceType
+from flexkv.cache.component import ComponentType, ComponentData, _NUM_COMPONENT_TYPES
 
 
 @dataclass
@@ -85,20 +86,23 @@ class RadixNode:
     parent: Optional['RadixNode'] = None
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
 
-    # ===== SWA (node-mounted) state — mirrors CRadixNode =====
-    swa_host_slot: int = -1            # CPU SWA host-pool slot id (-1 = no SWA)
-    swa_tombstone: bool = True         # True = no live SWA on this node
-    swa_lock_ref: int = 0              # SWA lock ref (invariant: <= lock_cnt)
-    swa_last_access_time: float = 0.0  # SWA-LRU timestamp
-    # intrusive SWA-LRU doubly-linked list pointers (independent of full LRU)
-    swa_lru_prev: Optional['RadixNode'] = None
-    swa_lru_next: Optional['RadixNode'] = None
-    on_swa_lru: bool = False
+    # ===== Generic component data (FULL, SWA, MAMBA, etc.) =====
+    component_data: list = field(default_factory=lambda: [ComponentData() for _ in range(_NUM_COMPONENT_TYPES)])
 
     def __post_init__(self) -> None:
         assert self.block_hashes.ndim == 1
         assert self.physical_blocks.ndim == 1
         assert self.block_hashes.size == self.physical_blocks.size
+
+    @property
+    def swa(self) -> ComponentData:
+        """Shortcut to SWA component data (backward compat)."""
+        return self.component_data[ComponentType.SWA]
+
+    @property
+    def mamba(self) -> ComponentData:
+        """Shortcut to mamba component data."""
+        return self.component_data[ComponentType.MAMBA]
 
     def __lt__(self, other: 'RadixNode') -> bool:
         return self.grace_time < other.grace_time
@@ -124,23 +128,31 @@ class RadixNode:
     def in_use(self) -> bool:
         # A node is in use (not full-evictable) if its Full KV is locked, its SWA
         # is locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
-        return self.lock_cnt > 0 or self.swa_lock_ref > 0 or not self.is_ready
+        if self.lock_cnt > 0 or not self.is_ready:
+            return True
+        return any(cd.is_locked() for cd in self.component_data)
+
+    def has_component(self, ct: ComponentType) -> bool:
+        """True iff this node carries live (non-tombstone) data for component ct."""
+        return self.component_data[ct].has_data()
 
     def has_swa(self) -> bool:
-        """True iff this node carries a live (non-tombstone) SWA slot."""
-        return (not self.swa_tombstone) and self.swa_host_slot >= 0
+        return self.has_component(ComponentType.SWA)
+
+    def has_mamba(self) -> bool:
+        return self.has_component(ComponentType.MAMBA)
 
     def inc_swa_lock_ref(self) -> None:
         """Pin the SWA against eviction (mirror of CRadixNode.inc_swa_lock_ref)."""
-        self.swa_lock_ref += 1
+        self.swa.lock_ref += 1
 
     def dec_swa_lock_ref(self) -> None:
         """Release one SWA eviction pin (mirror of CRadixNode.dec_swa_lock_ref).
 
         Keeps the SWA slot cached (unlike dec_swa_lock_only, which frees a leaf's
         SWA); used to drop a load-time pin once the SWA H2D has read the slot."""
-        assert self.swa_lock_ref > 0
-        self.swa_lock_ref -= 1
+        assert self.swa.lock_ref > 0
+        self.swa.lock_ref -= 1
 
     def lock(self) -> None:
         assert self.lock_cnt >= 0
@@ -172,7 +184,7 @@ class RadixNode:
         )
         # new_node (prefix) inherits NO SWA — its trailing page is an interior
         # page of the original node, which never carried a window.
-        assert new_node.swa_host_slot == -1 and new_node.swa_tombstone
+        assert new_node.swa.slot_id == -1 and new_node.swa.tombstone
         self.block_hashes = self.block_hashes[prefix_length:]
         self.physical_blocks = self.physical_blocks[prefix_length:]
 
@@ -240,8 +252,8 @@ class RadixTreeIndex:
         self._swa_lru_tail = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                        physical_blocks=np.array([], dtype=np.int64),
                                        is_ready=True, lock_cnt=0, grace_time=0.0)
-        self._swa_lru_head.swa_lru_next = self._swa_lru_tail
-        self._swa_lru_tail.swa_lru_prev = self._swa_lru_head
+        self._swa_lru_head.swa.lru_next = self._swa_lru_tail
+        self._swa_lru_tail.swa.lru_prev = self._swa_lru_head
         # SWA slots freed by structural changes (split / merge / evict / evict_swa),
         # drained by the cache engine to return them to the SWA host pool.
         self._freed_swa_slots: List[int] = []
@@ -259,8 +271,8 @@ class RadixTreeIndex:
                                    lock_cnt=0,
                                    grace_time=time.time())
         self.leaf_nodes.clear()
-        self._swa_lru_head.swa_lru_next = self._swa_lru_tail
-        self._swa_lru_tail.swa_lru_prev = self._swa_lru_head
+        self._swa_lru_head.swa.lru_next = self._swa_lru_tail
+        self._swa_lru_tail.swa.lru_prev = self._swa_lru_head
         self._freed_swa_slots.clear()
         # keep _swa_enabled sticky across reset (mirrors C++: the pool geometry /
         # SWA usage is a deployment property, not per-tree-generation state)
@@ -272,29 +284,29 @@ class RadixTreeIndex:
 
     def _swa_lru_add_mru(self, node: RadixNode) -> None:
         """Insert (or move) ``node`` at the MRU side (right after head)."""
-        if node.on_swa_lru:
+        if node.swa.on_lru:
             self._swa_lru_remove(node)
-        nxt = self._swa_lru_head.swa_lru_next
-        node.swa_lru_prev = self._swa_lru_head
-        node.swa_lru_next = nxt
-        self._swa_lru_head.swa_lru_next = node
-        nxt.swa_lru_prev = node
-        node.on_swa_lru = True
+        nxt = self._swa_lru_head.swa.lru_next
+        node.swa.lru_prev = self._swa_lru_head
+        node.swa.lru_next = nxt
+        self._swa_lru_head.swa.lru_next = node
+        nxt.swa.lru_prev = node
+        node.swa.on_lru = True
 
     def _swa_lru_remove(self, node: RadixNode) -> None:
-        if not node.on_swa_lru:
+        if not node.swa.on_lru:
             return
-        node.swa_lru_prev.swa_lru_next = node.swa_lru_next
-        node.swa_lru_next.swa_lru_prev = node.swa_lru_prev
-        node.swa_lru_prev = None
-        node.swa_lru_next = None
-        node.on_swa_lru = False
+        node.swa.lru_prev.swa.lru_next = node.swa.lru_next
+        node.swa.lru_next.swa.lru_prev = node.swa.lru_prev
+        node.swa.lru_prev = None
+        node.swa.lru_next = None
+        node.swa.on_lru = False
 
     def _swa_lru_get_lru_unlocked(self) -> Optional[RadixNode]:
         """Least-recently-used SWA node with swa_lock_ref == 0 (not just leaves)."""
-        x = self._swa_lru_tail.swa_lru_prev
-        while x is not self._swa_lru_head and x.swa_lock_ref > 0:
-            x = x.swa_lru_prev
+        x = self._swa_lru_tail.swa.lru_prev
+        while x is not self._swa_lru_head and x.swa.lock_ref > 0:
+            x = x.swa.lru_prev
         return x if x is not self._swa_lru_head else None
 
     def record_freed_swa_slot(self, node: RadixNode) -> None:
@@ -305,10 +317,10 @@ class RadixTreeIndex:
         the SWA-subset-of-Full invariant (I1) holds. The slot is buffered in
         ``_freed_swa_slots`` for the cache engine to drain back to the host pool.
         """
-        if node.swa_host_slot >= 0:
-            self._freed_swa_slots.append(node.swa_host_slot)
-        node.swa_host_slot = -1
-        node.swa_tombstone = True
+        if node.swa.slot_id >= 0:
+            self._freed_swa_slots.append(node.swa.slot_id)
+        node.swa.slot_id = -1
+        node.swa.tombstone = True
         self._swa_lru_remove(node)
 
     def drain_freed_swa_slots(self) -> List[int]:
@@ -326,12 +338,18 @@ class RadixTreeIndex:
         SWA-LRU recency.
         """
         assert node is not self.root_node
-        assert node.swa_host_slot < 0 or node.swa_host_slot == slot
-        node.swa_host_slot = slot
-        node.swa_tombstone = False
-        node.swa_last_access_time = time.time()
+        assert node.swa.slot_id < 0 or node.swa.slot_id == slot
+        node.swa.slot_id = slot
+        node.swa.tombstone = False
+        node.swa.last_access_time = time.time()
         self._swa_lru_add_mru(node)
         self._swa_enabled = True  # arm the I2 cascade in full-KV evict()
+
+    def promote_component(self, node: RadixNode, ct: ComponentType) -> None:
+        """Promote a node's component to MRU in its component-specific LRU."""
+        if ct == ComponentType.SWA:
+            self.promote_swa(node)
+        # MAMBA LRU: TODO (add _mamba_lru_head/tail + _mamba_lru_add_mru)
 
     def promote_swa(self, node: RadixNode) -> None:
         """Refresh a node's SWA recency on read-hit: splice it to the SWA-LRU MRU.
@@ -344,7 +362,7 @@ class RadixTreeIndex:
         on the SWA-LRU; re-adding it would corrupt the list)."""
         if node is self.root_node or not node.has_swa():
             return
-        node.swa_last_access_time = time.time()
+        node.swa.last_access_time = time.time()
         self._swa_lru_add_mru(node)  # remove+reinsert = move to MRU (idempotent)
 
     def merge_child(self, node: RadixNode) -> None:
@@ -357,15 +375,15 @@ class RadixTreeIndex:
         """
         assert node.num_children() == 1
         child = list(node.children.values())[0]
-        child_slot = child.swa_host_slot
+        child_slot = child.swa.slot_id
         node.merge_child()  # block-level merge + children.clear()
         # SWA handoff (I0): release parent's own (now-stale) SWA, then move the
         # child's SWA onto the merged node.
         self.record_freed_swa_slot(node)          # frees parent's old slot (if any)
         if child_slot >= 0:
             self._swa_lru_remove(child)           # detach the doomed child
-            child.swa_host_slot = -1
-            child.swa_tombstone = True
+            child.swa.slot_id = -1
+            child.swa.tombstone = True
             if node is not self.root_node:
                 self.set_swa(node, child_slot)    # remount on the merged node
             else:
@@ -405,9 +423,10 @@ class RadixTreeIndex:
                     # current_node is FULLY matched (whole size consumed): if it
                     # carries a live SWA at its trailing page, it is the new
                     # deepest SWA hit (single forward pass, no backtracking).
-                    if current_node.has_swa():
-                        last_swa_node = current_node
-                        swa_hit_blocks = ready_prefix_blocks_num
+                    for ct in ComponentType:
+                        if current_node.has_component(ct):
+                            component_hit_nodes[ct] = current_node
+                            component_hit_blocks[ct] = ready_prefix_blocks_num
                 prefix_blocks_num += current_node.size()
                 physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks])
                 current_node = current_node.children[child_hash]
@@ -431,9 +450,11 @@ class RadixTreeIndex:
                     ready_prefix_blocks_num += matched_length
                     # Only a FULL node match (matched_length == size) exposes the
                     # trailing page, so only then can this node's SWA be reused.
-                    if matched_length == current_node.size() and current_node.has_swa():
-                        last_swa_node = current_node
-                        swa_hit_blocks = ready_prefix_blocks_num
+                    if matched_length == current_node.size():
+                        for ct in ComponentType:
+                            if current_node.has_component(ct):
+                                component_hit_nodes[ct] = current_node
+                                component_hit_blocks[ct] = ready_prefix_blocks_num
                 last_node_matched_length = matched_length
                 prefix_blocks_num += matched_length
                 break
@@ -443,16 +464,18 @@ class RadixTreeIndex:
         # never-reused one. last_swa_node is the deepest fully-matched ready node
         # with a live SWA slot (or None); promote_swa no-ops on root / no-SWA.
         # A probe (update_cache_info=False) must NOT touch the SWA-LRU.
-        if update_cache_info and last_swa_node is not None:
-            self.promote_swa(last_swa_node)
+        if update_cache_info:
+            for ct, node in component_hit_nodes.items():
+                if node is not None:
+                    self.promote_component(node, ct)
         return MatchResult(num_matched_blocks=prefix_blocks_num,
                            num_ready_matched_blocks=ready_prefix_blocks_num,
                            last_ready_node=last_ready_node,
                            last_node=current_node,
                            last_node_matched_length=last_node_matched_length,
                            physical_blocks=physical_blocks,
-                           last_swa_node=last_swa_node,
-                           swa_hit_blocks=swa_hit_blocks)
+                           component_hit_nodes=component_hit_nodes,
+                           component_hit_blocks=component_hit_blocks)
 
     def num_matched_blocks(self,
                     sequence: SequenceMeta) -> int:
@@ -635,7 +658,7 @@ class RadixTreeIndex:
         (empty when nothing was removed).
         """
         if (node is None or node.is_root() or node.is_ready
-                or node.lock_cnt > 0 or node.swa_lock_ref > 0
+                or node.lock_cnt > 0 or node.swa.lock_ref > 0
                 or not node.is_leaf()):
             return np.array([], dtype=np.int64)
         parent = node.parent
@@ -664,7 +687,7 @@ class RadixTreeIndex:
         freed = np.array([], dtype=np.int64)
         freed_hashes = np.array([], dtype=np.int64)
         while (node is not None and not node.is_root() and node.is_leaf()
-               and node.swa_tombstone and node.lock_cnt == 0 and node.is_ready):
+               and node.swa.tombstone and node.lock_cnt == 0 and node.is_ready):
             parent = node.parent
             assert parent is not None
             parent.children.pop(node.head_hash(), None)
@@ -699,8 +722,8 @@ class RadixTreeIndex:
         while cur is not None and not cur.is_root():
             cur.lock_cnt += 1
             if swa_boundary is None and cur.has_swa():
-                cur.swa_lock_ref += 1
-                assert cur.lock_cnt >= cur.swa_lock_ref  # I3
+                cur.swa.lock_ref += 1
+                assert cur.lock_cnt >= cur.swa.lock_ref  # I3
                 swa_boundary = cur
             cur = cur.parent
         return swa_boundary
@@ -717,9 +740,9 @@ class RadixTreeIndex:
             cur.lock_cnt -= 1
             # Release the SWA lock only on the exact boundary node (symmetric
             # with inc_lock_ref, which locked only that one node).
-            if not skip_swa and cur is swa_boundary and cur.swa_lock_ref > 0:
-                cur.swa_lock_ref -= 1
-            assert cur.lock_cnt >= cur.swa_lock_ref  # I3
+            if not skip_swa and cur is swa_boundary and cur.swa.lock_ref > 0:
+                cur.swa.lock_ref -= 1
+            assert cur.lock_cnt >= cur.swa.lock_ref  # I3
             cur = cur.parent
 
     def dec_swa_lock_only(self, swa_boundary: Optional[RadixNode]) -> None:
@@ -734,9 +757,9 @@ class RadixTreeIndex:
         if swa_boundary is None:
             return
         cur = swa_boundary
-        assert cur.swa_lock_ref > 0, "dec_swa_lock_only on an unlocked SWA node"
-        cur.swa_lock_ref -= 1
-        if cur.swa_lock_ref == 0 and cur.has_swa() and cur.is_leaf():
+        assert cur.swa.lock_ref > 0, "dec_swa_lock_only on an unlocked SWA node"
+        cur.swa.lock_ref -= 1
+        if cur.swa.lock_ref == 0 and cur.has_swa() and cur.is_leaf():
             # Leaf: free SWA now (Full stays until the full lock drops).
             # An internal node keeps its SWA, staying evictable on the SWA-LRU.
             self.record_freed_swa_slot(cur)
