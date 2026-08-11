@@ -328,10 +328,9 @@ class CacheEngineAccel:
             physical_blocks=phys,
             block_node_ids=bnids_np,
             matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
-            # SWA node-mount: carry the SWA hit found on the SAME forward pass so
-            # the SWA-aware get can reuse it (no second match_prefix walk).
-            last_swa_node=getattr(match_result, "last_swa_node", None),
-            swa_hit_blocks=int(getattr(match_result, "swa_hit_blocks", 0) or 0),
+            # Component hits (SWA, mamba, etc.) from the same forward pass
+            component_hit_nodes=getattr(match_result, "component_hit_nodes", {}),
+            component_hit_blocks=getattr(match_result, "component_hit_blocks", {}),
         )
 
     def insert(self,
@@ -2432,7 +2431,7 @@ class GlobalCacheEngine:
             if match_result is None:
                 continue
 
-            swa_hit = int(match_result.swa_hit_blocks)
+            swa_hit = int(match_result.component_hit_blocks.get(ComponentType.SWA, 0))
             if swa_hit <= block_mask_start:
                 continue
 
@@ -2443,7 +2442,7 @@ class GlobalCacheEngine:
                 continue
 
             if not self._is_mooncake_swa_tier(device_type):
-                assert match_result.last_swa_node is not None
+                assert match_result.component_hit_nodes.get(ComponentType.SWA, None) is not None
             candidates.append((swa_hit, device_type, match_result))
 
         for usable_end, device_type, match_result in sorted(
@@ -2466,7 +2465,7 @@ class GlobalCacheEngine:
                     mooncake_tail_hash=tail_hash,
                 )
 
-            source_node = match_result.last_swa_node
+            source_node = match_result.component_hit_nodes.get(ComponentType.SWA, None)
             source_slot = int(source_node.swa_host_slot)
             assert source_slot >= 0
 
