@@ -67,9 +67,6 @@ class MambaStateConfig:
     num_ssd_slots: int = 0
     num_remote_slots: int = 0
 
-    # int8 compression (future extension, default off — bf16 is default)
-    enable_int8_compress: bool = False
-
     # L3 SSD
     ssd_dir: str = ""  # directory for SSD spill (empty = disabled)
 
@@ -93,7 +90,7 @@ class MambaStateConnectorBase:
         self._config = config
         self._transfer_engine = transfer_engine  # FlexKV TransferManager (optional, for L3)
 
-        # L2: CPU int8 checkpoint pool
+        # L2: CPU checkpoint pool (native dtype, no compression)
         from flexkv.mamba_state.config import MambaStatePoolConfig
         pool_config = MambaStatePoolConfig(
             num_linear_layers=config.num_linear_layers,
@@ -102,11 +99,9 @@ class MambaStateConnectorBase:
             head_k_dim=config.head_k_dim,
             conv_shape=config.conv_shapes[0] if config.conv_shapes else (),
             conv_shapes=config.conv_shapes,
-            # P1-4: only single conv type supported (all known models have 1)
-            # If future models have multiple conv types, pool needs per-type buffers
             num_cpu_slots=config.num_cpu_slots,
-            compress_dtype=torch.int8 if config.enable_int8_compress else torch.bfloat16,
-            scale_dtype=config.temporal_dtype,
+            temporal_dtype=config.temporal_dtype,
+            conv_dtype=config.conv_dtype,
         )
         self._ckpt_pool = MambaCheckpointPool(pool_config, device="cpu")
 
@@ -165,7 +160,6 @@ class MambaStateConnectorBase:
             config.head_v_dim,
             config.head_k_dim,
             config.num_cpu_slots,
-            config.enable_int8_compress,
         )
 
     # ------------------------------------------------------------------
@@ -390,13 +384,12 @@ class MambaStateConnectorBase:
     # ------------------------------------------------------------------
 
     def _spill_to_ssd(self, prefix_hash: str, ckpt_slot: int) -> None:
-        """Serialize int8 checkpoint slot to SSD file."""
+        """Serialize checkpoint slot to SSD file."""
         import os
         file_path = os.path.join(self._ssd_dir, f"{prefix_hash}.pt")
         try:
             torch.save({
-                "qdata": self._ckpt_pool.qdata[:, ckpt_slot].clone(),
-                "scale": self._ckpt_pool.scale[:, ckpt_slot].clone(),
+                "temporal": self._ckpt_pool.temporal[:, ckpt_slot].clone(),
                 "conv": [c[:, ckpt_slot].clone() for c in self._ckpt_pool.conv],
             }, file_path)
             self._ssd_paths[prefix_hash] = file_path
@@ -419,8 +412,7 @@ class MambaStateConnectorBase:
                     ckpt_slot = self._ckpt_pool.allocate()
             if ckpt_slot is None:
                 return None
-            self._ckpt_pool.qdata[:, ckpt_slot].copy_(data["qdata"])
-            self._ckpt_pool.scale[:, ckpt_slot].copy_(data["scale"])
+            self._ckpt_pool.temporal[:, ckpt_slot].copy_(data["temporal"])
             for i, c in enumerate(self._ckpt_pool.conv):
                 c[:, ckpt_slot].copy_(data["conv"][i])
             self._prefix_map[prefix_hash] = ckpt_slot

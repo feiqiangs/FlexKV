@@ -31,16 +31,14 @@ class MambaStatePoolConfig:
     num_cpu_slots: int = 2048
     evict_ratio: float = 0.1
 
-    # --- compression ---
-    # bf16: lossless, aligned with sglang HiCache host pool (default).
-    # int8: 2x capacity, aligned with sglang Int8CheckpointStore (future extension).
-    compress_dtype: torch.dtype = torch.bfloat16
-    scale_dtype: torch.dtype = torch.bfloat16
+    # --- dtypes (auto-read from framework pool, no compression) ---
+    temporal_dtype: torch.dtype = torch.bfloat16
+    conv_dtype: torch.dtype = torch.bfloat16
 
     @property
     def state_bytes_per_layer(self) -> int:
-        """One linear layer's temporal state: [H, d_v, d_k] bf16."""
-        return self.num_heads * self.head_v_dim * self.head_k_dim * 2
+        """One linear layer's temporal state: [H, d_v, d_k]."""
+        return self.num_heads * self.head_v_dim * self.head_k_dim * self.temporal_dtype.itemsize
 
     @property
     def conv_bytes_per_layer(self) -> int:
@@ -48,21 +46,12 @@ class MambaStatePoolConfig:
         elem = 1
         for s in self.conv_shape:
             elem *= s
-        return elem * 2  # bf16
+        return elem * self.conv_dtype.itemsize
 
     @property
     def total_active_bytes(self) -> int:
         """All linear layers' active state for one request."""
         return self.num_linear_layers * (self.state_bytes_per_layer + self.conv_bytes_per_layer)
-
-    @property
-    def total_checkpoint_bytes_int8(self) -> int:
-        """All linear layers' int8 compressed checkpoint (state + scale + conv)."""
-        L = self.num_linear_layers
-        state_int8 = L * self.num_heads * self.head_v_dim * self.head_k_dim * 1
-        scale = L * self.num_heads * 1 * self.head_k_dim * 2
-        conv = L * self.conv_bytes_per_layer
-        return state_int8 + scale + conv
 
     @property
     def enabled(self) -> bool:

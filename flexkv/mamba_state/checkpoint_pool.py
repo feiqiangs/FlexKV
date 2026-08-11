@@ -1,23 +1,9 @@
-"""MambaCheckpointPool — CPU-side int8-compressed store for cached
-linear-attention recurrent states.
+"""MambaCheckpointPool — CPU-side store for cached linear-attention recurrent states.
 
-Decouples cached states (radix-owned, idle, int8 compressed) from the active
-MambaActiveStatePool (running requests, full precision, kernel-facing).
+Stores temporal + conv state at native dtype (bf16), no compression.
+Future int8 quantization can be added as an extension.
 
-Per cached slot it holds:
-  * temporal state in int8 (per-(head, k-channel) symmetric quantization)
-    — ~2x more cached states than bf16, quality-safe
-  * conv1d window at native dtype (tiny, W-1 tokens, not worth quantizing)
-
-Why int8 not fp8: a cached checkpoint is loaded ONCE on a cache hit, then
-decoding continues at full precision, so the only error is a single rounding
-of S. The temporal state is roughly uniformly distributed, so int8
-per-(head, k-channel) beats fp8-e4m3 at the same 1 byte (fp8 wastes bits on
-the exponent). The scale axis (reduces over d_v) matches the per-k-channel
-decay diag(alpha), so large state entries keep ~bf16 precision and error
-concentrates on small entries that barely affect the readout.
-
-Design references: sglang MambaCheckpointPool / Int8CheckpointStore.
+Design references: sglang HiCache MambaPoolHost (bf16 host pool).
 """
 from typing import Any, List, Optional, Tuple
 
@@ -27,18 +13,12 @@ from flexkv.mamba_state.config import MambaStatePoolConfig
 
 
 class MambaCheckpointPool:
-    """CPU-side int8-compressed store for cached recurrent states.
-
-    Model-agnostic: treats state as structured tensors (not opaque bytes),
-    applying per-(head, k-channel) symmetric int8 quantization.
+    """CPU-side store for cached recurrent states (native dtype, no compression).
 
     Tensors:
-        qdata: [L, num_slots, H, d_v, d_k]  int8         (quantized temporal)
-        scale: [L, num_slots, H, 1,   d_k]  scale_dtype  (per head,k-channel)
-        conv:  [L, num_slots, *conv_shape]  bf16         (not quantized)
+        temporal: [L, num_slots, H, d_v, d_k]  native dtype (bf16)
+        conv:     [L, num_slots, *conv_shape]  native dtype (bf16)
     """
-
-    QMAX = 127
 
     def __init__(self, config: MambaStatePoolConfig, device: str = "cpu"):
         self.config = config
@@ -50,23 +30,18 @@ class MambaCheckpointPool:
         dk = config.head_k_dim
         num_slots = config.num_cpu_slots
 
-        # int8 quantized temporal state
-        self.qdata = torch.empty(
+        # temporal state at native dtype
+        self.temporal = torch.empty(
             L, num_slots, H, dv, dk,
-            dtype=config.compress_dtype, device=device,
+            dtype=config.temporal_dtype, device=device,
         )
-        # per-(head, k-channel) scale: reduction axis = d_v (dim=-2)
-        self.scale = torch.empty(
-            L, num_slots, H, 1, dk,
-            dtype=config.scale_dtype, device=device,
-        )
-        # conv window at native dtype (not quantized)
+        # conv window at native dtype
         # Support multi-conv-type: allocate separate buffer per conv shape
         conv_shapes = config.conv_shapes if config.conv_shapes else [config.conv_shape]
         self.conv = [
             torch.empty(
                 (L, num_slots) + shape,
-                dtype=torch.bfloat16, device=device,
+                dtype=config.conv_dtype, device=device,
             )
             for shape in conv_shapes
         ]
@@ -89,48 +64,7 @@ class MambaCheckpointPool:
             return
         self._free_slots.append(slot_id)
 
-    # --- quantization (store path: active bf16 → cached int8) -------------
-
-    @classmethod
-    def quantize(cls, state_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantize temporal state to int8.
-
-        Args:
-            state_bf16: [..., H, d_v, d_k] bf16/fp16/fp32
-
-        Returns:
-            qdata: [..., H, d_v, d_k] int8
-            scale: [..., H, 1, d_k] same dtype as input
-
-        Algorithm (matches sglang Int8CheckpointStore):
-          1. All math in float32 to avoid low-precision intermediate loss
-          2. scale = amax(|state|, dim=d_v) / 127, rounded to state dtype
-             BEFORE division — so quantize and dequantize use identical scale
-          3. scale reduction axis = d_v (dim=-2), aligned with per-k-channel
-             decay diag(alpha)
-          4. Symmetric quantization (no zero-point), clamp [-127, 127]
-        """
-        state_fp32 = state_bf16.to(torch.float32)
-        # amax over d_v (dim=-2) -> [..., H, 1, d_k]
-        amax = state_fp32.abs().amax(dim=-2, keepdim=True).clamp(min=1e-8)
-        scale = (amax / cls.QMAX).to(state_bf16.dtype)  # round to source dtype first
-        qdata = torch.round(state_fp32 / scale.to(torch.float32)).clamp(
-            -cls.QMAX, cls.QMAX
-        ).to(torch.int8)
-        return qdata, scale
-
-    @staticmethod
-    def dequantize(qdata: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        """Dequantize int8 back to bf16.
-
-        Args:
-            qdata: [..., H, d_v, d_k] int8
-            scale: [..., H, 1, d_k] scale_dtype
-
-        Returns:
-            [..., H, d_v, d_k] bf16
-        """
-        return (qdata.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+    # --- store / load (native dtype, no compression) ----------------------
 
     def store_from_active(
         self,
@@ -138,41 +72,27 @@ class MambaCheckpointPool:
         temporal_bf16: torch.Tensor,
         conv_bf16,
     ) -> None:
-        """Compress and store one active snapshot into a cached slot.
+        """Store one active snapshot into a cached slot (direct copy).
 
         Args:
             slot_id: checkpoint pool slot
-            temporal_bf16: [L, H, d_v, d_k] bf16 from active pool
-            conv_bf16: [L, *conv_shape] bf16 or List of bf16 (multi-conv-type)
+            temporal_bf16: [L, H, d_v, d_k] from active pool
+            conv_bf16: [L, *conv_shape] or List of bf16 (multi-conv-type)
         """
-        if self.config.compress_dtype == torch.int8:
-            qdata, scale = self.quantize(temporal_bf16)
-            self.qdata[:, slot_id].copy_(qdata)
-            self.scale[:, slot_id].copy_(scale)
-        else:
-            # bf16 mode: store directly without quantization
-            self.qdata[:, slot_id].copy_(temporal_bf16)
+        self.temporal[:, slot_id].copy_(temporal_bf16)
         if isinstance(conv_bf16, (list, tuple)):
             for i, cb in enumerate(conv_bf16):
                 self.conv[i][:, slot_id].copy_(cb)
         else:
             self.conv[0][:, slot_id].copy_(conv_bf16)
 
-    # --- dequantization (load path: cached → active bf16) ----------------
-
     def load_to_active(self, slot_id: int) -> Tuple[torch.Tensor, Any]:
-        """Decompress one cached slot back to bf16 tensors (CoW target).
+        """Load one cached slot back to tensors (CoW target).
 
-        Returns (temporal_bf16, conv_bf16) — caller copies into active slot.
-        conv_bf16 is a single tensor if 1 conv type, or a list if multi.
+        Returns (temporal, conv) — caller copies into active slot.
+        conv is a single tensor if 1 conv type, or a list if multi.
         """
-        if self.config.compress_dtype == torch.int8:
-            temporal_bf16 = self.dequantize(
-                self.qdata[:, slot_id], self.scale[:, slot_id]
-            )
-        else:
-            # bf16 mode: no dequantization needed
-            temporal_bf16 = self.qdata[:, slot_id].clone()
+        temporal_bf16 = self.temporal[:, slot_id].clone()
         if self._num_conv_types == 1:
             conv_bf16 = self.conv[0][:, slot_id].clone()
         else:
