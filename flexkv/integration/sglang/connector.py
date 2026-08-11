@@ -192,9 +192,9 @@ class FlexKVConnector:
         # 3. If FLEXKV_CPU_CACHE_RATIO is set, derive num_cpu_blocks from
         # GPU pool size (same mechanism as sglang --hicache-ratio).
         # Applies to token KV too, not just mamba.
-        ratio_env = os.environ.get("FLEXKV_CPU_CACHE_RATIO", "")
-        if ratio_env:
-            ratio = float(ratio_env)
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+        if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0:
+            ratio = GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio
             gpu_blocks = getattr(kvcache, "size", 0)
             if not gpu_blocks:
                 # Try summing known pool attributes (DSv4 multi-pool)
@@ -2284,11 +2284,11 @@ class FlexKVConnector:
         # Otherwise derive from device pool size × ratio (aligned with
         # sglang --hicache-ratio). int8 compression gives 2x, so
         # cpu_slots = device_slots × ratio × 2.
-        cpu_slots_env = os.environ.get("FLEXKV_MAMBA_CPU_SLOTS", "0")
-        if int(cpu_slots_env) > 0:
-            num_cpu_slots = int(cpu_slots_env)
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+        if GLOBAL_CONFIG_FROM_ENV.mamba_cpu_slots > 0:
+            num_cpu_slots = GLOBAL_CONFIG_FROM_ENV.mamba_cpu_slots
         else:
-            ratio = float(os.environ.get("FLEXKV_CPU_CACHE_RATIO", "2.0"))
+            ratio = GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio if GLOBAL_CONFIG_FROM_ENV.cpu_cache_ratio > 0 else 2.0
             device_slots = getattr(mamba_pool, "size", 256)
             num_cpu_slots = int(device_slots * ratio * 2)  # 2x for int8
 
@@ -2309,10 +2309,10 @@ class FlexKVConnector:
             conv_dtype=conv_dtype,
             temporal_dtype=temporal_dtype,
             num_cpu_slots=num_cpu_slots,
-            enable_donate=os.environ.get("FLEXKV_MAMBA_DONATE", "0") == "1",
-            num_donate_slots=int(os.environ.get("FLEXKV_MAMBA_DONATE_SLOTS", "64")),
-            write_policy=os.environ.get("FLEXKV_WRITE_POLICY", "write_through"),
-            write_through_threshold=int(os.environ.get("FLEXKV_WRITE_THROUGH_THRESHOLD", "2")),
+            enable_donate=GLOBAL_CONFIG_FROM_ENV.mamba_donate,
+            num_donate_slots=GLOBAL_CONFIG_FROM_ENV.mamba_donate_slots,
+            write_policy=GLOBAL_CONFIG_FROM_ENV.write_policy,
+            write_through_threshold=GLOBAL_CONFIG_FROM_ENV.write_through_threshold,
             ssd_dir=ssd_dir,
         )
 

@@ -823,6 +823,18 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_manager_shutdown_timeout_s=float(
         os.getenv('FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S', 900)
     ),
+
+    # Cache write policy (global: applies to token KV and mamba state)
+    write_policy=os.getenv('FLEXKV_WRITE_POLICY', 'write_through'),
+    write_through_threshold=int(os.getenv('FLEXKV_WRITE_THROUGH_THRESHOLD', 2)),
+    cpu_cache_ratio=float(os.getenv('FLEXKV_CPU_CACHE_RATIO', '0')),  # 0 = use config file
+
+    # Mamba state (mamba-specific, no token KV equivalent)
+    mamba_donate=bool(int(os.getenv('FLEXKV_MAMBA_DONATE', 0))),
+    mamba_donate_slots=int(os.getenv('FLEXKV_MAMBA_DONATE_SLOTS', 64)),
+    mamba_cpu_slots=int(os.getenv('FLEXKV_MAMBA_CPU_SLOTS', 0)),  # 0 = auto from ratio
+    mamba_decode_interval=int(os.getenv('FLEXKV_MAMBA_DECODE_INTERVAL', 256)),
+    mamba_chunk_size=int(os.getenv('FLEXKV_MAMBA_CHUNK_SIZE', 1)),
 )
 
 @dataclass
